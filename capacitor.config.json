@@ -1,0 +1,15 @@
+{
+  "appId": "me.intern7zsa.awardvoting",
+  "appName": "Award Voting System",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "capacitor"
+  },
+  "plugins": {
+    "FirebaseAuthentication": {
+      "skipNativeAuth": true,
+      "providers": ["google.com"]
+    }
+  }
+}

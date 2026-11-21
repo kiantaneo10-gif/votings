@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Award Voting System</string>
+    <string name="title_activity_main">Award Voting System</string>
+    <string name="package_name">me.intern7zsa.awardvoting</string>
+    <string name="custom_url_scheme">me.intern7zsa.awardvoting</string>
+</resources>
