@@ -21,8 +21,6 @@ for (const name of requiredSecrets) {
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const cookieSecure = process.env.COOKIE_SECURE === '1' || process.env.NODE_ENV === 'production';
-const cookieSameSite = cookieSecure ? 'none' : 'strict';
-const nativeOrigins = new Set(['capacitor://localhost', 'https://localhost']);
 const configRef = db.collection('electionConfig').doc('main');
 const candidatesRef = db.collection('candidates');
 const awardsRef = db.collection('awards');
@@ -66,21 +64,6 @@ app.use(helmet({
   },
   crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' }
 }));
-app.use((req, res, next) => {
-  const origin = req.get('Origin');
-  if (nativeOrigins.has(origin)) {
-    res.set({
-      'Access-Control-Allow-Origin': origin,
-      'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-CSRF-Token',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Cross-Origin-Resource-Policy': 'cross-origin'
-    });
-    res.vary('Origin');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-  }
-  next();
-});
 app.use(express.json({ limit: '16kb' }));
 app.use(session({
   name: 'award.sid',
@@ -90,7 +73,7 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: cookieSameSite,
+    sameSite: 'lax',
     secure: cookieSecure,
     maxAge: 8 * 60 * 60 * 1000
   }

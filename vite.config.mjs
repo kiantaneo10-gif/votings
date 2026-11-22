@@ -7,7 +7,7 @@ const projectRoot = fileURLToPath(new URL('.', import.meta.url));
 export default defineConfig({
   base: './',
   plugins: [{
-    name: 'capacitor-index-html',
+    name: 'web-index-html',
     closeBundle() {
       copyFileSync(`${projectRoot}dist/Votings.html`, `${projectRoot}dist/index.html`);
     }

@@ -74,29 +74,11 @@ The server validates every vote and writes the voter record, anonymous vote, and
 - Optionally schedule a start date while the election is closed. Every start or reopen creates a 10-minute voting window; the server automatically closes voting at the deadline and rejects any later submissions.
 - Exactly six awards and three candidates are required to start voting. All three nominees appear under each award.
 - Voters sign in with Google, choose one nominee per award, and submit all six choices together. The server verifies the Firebase ID token, requires a verified Google email, stores only an HMAC hash of the email, and rejects repeat ballots from that account.
-- The website uses Google's browser account chooser on mobile and a popup on desktop. The native Android/iOS app uses Firebase's native Google sign-in, which can offer Google accounts available on the device; it synchronizes the resulting Firebase credential with the web client before voting.
+- The responsive website works in desktop and mobile browsers. Google sign-in uses a redirect in mobile browsers and a popup on desktop. The Firebase project's linked Google OAuth web client must allow `https://votings-1.onrender.com/__/auth/handler` as an authorized redirect URI for the mobile redirect flow.
 - The administrator can rename awards from **Awards** and finish voting early from **Overview** or **Voting management**. Otherwise it closes automatically after 10 minutes. The overview and **Winner announcement** views then show the winner or tie for each award; while voting is open, they show current leaders only.
 - The voter page and administrator pages display a live countdown based on the election deadline saved by the server.
 - Google sign-in prevents reuse of the same account, but does not restrict voting to a pre-approved roster of Google accounts.
 - Results refresh every 10 seconds in the administrator dashboard. CSV export includes each award, nominee, vote total, and percentage.
 - The final winner or tie is determined independently for each award only after voting closes. Live detailed results remain administrator-only.
-
-## Native Android and iOS app
-
-The native project uses the provisional app ID `me.intern7zsa.awardvoting` for both platforms. Change `appId` in `capacitor.config.json` before registering the apps in Firebase if you want a different permanent identifier. In the native app, voters can choose native device Google sign-in or open the browser account chooser. The mobile build points to `https://intern7zsa.me` (configured in `.env.mobile`); deploy the server at that HTTPS origin before testing on a device.
-
-1. The `android/` and `ios/` projects are already scaffolded. Install dependencies and sync the native projects:
-
-   ```powershell
-   npm install
-   npm run cap:sync
-   ```
-
-2. In Firebase Console, add an Android app with the exact app ID and an Apple app with the exact bundle ID. Download `google-services.json` to `android/app/`. Put `GoogleService-Info.plist` in `ios/App/App/` and add it to the app target in Xcode. These files are intentionally ignored by Git.
-3. For Android, add your app signing certificate's SHA-1 fingerprint in Firebase project settings and enable Google sign-in. The generated `android/variables.gradle` already enables the Google provider and sets the required Credentials version. Add the Play App Signing SHA-1 too before distributing through Google Play.
-4. For iOS, configure the reversed client ID from `GoogleService-Info.plist` as a URL scheme in the Xcode app target. Build and run the iOS project on macOS with Xcode; Windows cannot build iOS apps.
-5. Before building the mobile app, ensure `.env.mobile` contains the final public HTTPS backend URL, then run `npm run cap:sync`. Use Android Studio or Xcode to build and install the native app.
-
-The native app needs the deployed backend because phones cannot reach the development server at `localhost:3000`. The server allows requests from the Capacitor app origins and uses secure cross-site session cookies when `COOKIE_SECURE=1` or `NODE_ENV=production`.
 
 For production, serve the app only over HTTPS, use a least-privilege Google service identity, keep application secrets out of source control, and back up the Firestore database.

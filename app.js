@@ -1,5 +1,3 @@
-import { Browser } from '@capacitor/browser';
-import { Capacitor } from '@capacitor/core';
 import {
   completeGoogleRedirect,
   getCurrentVoter,
@@ -12,7 +10,6 @@ const main = document.getElementById('main-content');
 const statusPill = document.getElementById('public-status');
 const toast = document.getElementById('toast');
 const dialog = document.getElementById('confirm-dialog');
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '';
 let csrfToken = '';
 let adminUsername = '';
 let pendingVote = null;
@@ -69,7 +66,6 @@ function googleAuthErrorMessage(error) {
 async function api(url, options = {}) {
   const method = options.method || 'GET';
   const headers = { ...(options.headers || {}) };
-  const requestUrl = apiBaseUrl ? new URL(url, apiBaseUrl).toString() : url;
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && csrfToken) headers['X-CSRF-Token'] = csrfToken;
   if (url === '/api/vote' || url === '/api/voter/status') {
@@ -77,9 +73,9 @@ async function api(url, options = {}) {
     if (!token) throw new Error('Sign in with Google before voting.');
     headers.Authorization = `Bearer ${token}`;
   }
-  const response = await fetch(requestUrl, {
+  const response = await fetch(url, {
     method,
-    credentials: apiBaseUrl ? 'include' : 'same-origin',
+    credentials: 'same-origin',
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body)
   });
@@ -209,10 +205,9 @@ async function renderPublic(errorMessage = '') {
         <div class="panel center-panel">
           ${voter
             ? `<p class="muted" style="margin-bottom:14px">Signed in as <strong>${escapeHtml(voter.email || 'Google account')}</strong></p><button id="voter-signout" class="button button-secondary button-sm" type="button">Sign out</button>`
-            : `<p class="muted">Sign in with Google to vote. Each verified Google email can submit one ballot. On phones, choose a Google account offered by the app or browser.</p>
+            : `<p class="muted">Sign in with Google to vote. Each verified Google email can submit one ballot. On phones, choose a Google account offered by your browser.</p>
               <div class="sign-in-options">
-                <button id="google-signin" class="button button-primary" type="button">${Capacitor.isNativePlatform() ? 'Use device Google account' : 'Continue with Google'}</button>
-                ${Capacitor.isNativePlatform() && apiBaseUrl ? '<button id="google-browser-signin" class="button button-secondary" type="button">Use browser account chooser</button>' : ''}
+                <button id="google-signin" class="button button-primary" type="button">Continue with Google</button>
               </div>`}
         </div>` : ''}
       ${awards.length ? `<form id="ballot-form" class="ballot-form">${ballot}<div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Sign in and choose one name for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>Submit all six choices (0/6)</button></div></form>` : ''}
@@ -230,17 +225,6 @@ async function renderPublic(errorMessage = '') {
         showToast(googleAuthErrorMessage(error));
       }
     });
-    const browserSignInButton = document.getElementById('google-browser-signin');
-    if (browserSignInButton) browserSignInButton.addEventListener('click', async () => {
-      browserSignInButton.disabled = true;
-      try {
-        await Browser.open({ url: apiBaseUrl });
-      } catch (error) {
-        browserSignInButton.disabled = false;
-        showToast(error.message || 'The browser sign-in could not be opened.');
-      }
-    });
-
     const signOutButton = document.getElementById('voter-signout');
     if (signOutButton) signOutButton.addEventListener('click', async () => {
       try {
