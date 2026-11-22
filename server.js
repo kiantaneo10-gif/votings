@@ -24,7 +24,7 @@ const candidatesRef = db.collection('candidates');
 const awardsRef = db.collection('awards');
 const requiredAwardCount = 6;
 const maxVotesPerAward = 55;
-const votingDurationMs = 10 * 60 * 1000;
+const votingDurationOptions = [5, 10, 15, 20];
 const sessionStore = new FirestoreSessionStore();
 let autoCloseTimer;
 
@@ -85,6 +85,44 @@ function awardVoteCount(award) {
 function voteLimitReached(config, awards = []) {
   return Number(config.totalBallots || 0) >= maxVotesPerAward ||
     awards.some(award => awardVoteCount(award) >= maxVotesPerAward);
+}
+
+function tieBreakOpen(config) {
+  const end = timestampMillis(config.tieBreak && config.tieBreak.endAt);
+  return Boolean(config.tieBreak && config.tieBreak.status === 'open' &&
+    end !== null && Date.now() < end);
+}
+
+function copyTieBreak(tieBreak) {
+  return {
+    ...tieBreak,
+    awards: Object.fromEntries(Object.entries(tieBreak.awards || {}).map(([id, award]) => [id, {
+      ...award,
+      candidateIds: [...award.candidateIds],
+      ...(award.pendingCandidateIds ? { pendingCandidateIds: [...award.pendingCandidateIds] } : {}),
+      results: { ...award.results }
+    }]))
+  };
+}
+
+function effectiveTieBreak(config, candidates) {
+  if (!config.tieBreak) return null;
+  const tieBreak = copyTieBreak(config.tieBreak);
+  if (tieBreak.status === 'open' && !tieBreakOpen(config)) tieBreak.status = 'needs_admin';
+  Object.values(tieBreak.awards || {}).forEach(award => {
+    if (award.winnerCandidateId) return;
+    const result = toResults(candidates.filter(candidate => award.candidateIds.includes(candidate.id)), award.results);
+    if (result.leaders.length === 1) award.winnerCandidateId = result.leaders[0].id;
+    else award.pendingCandidateIds = result.leaders.length
+      ? result.leaders.map(candidate => candidate.id)
+      : [...award.candidateIds];
+  });
+  if (tieBreak.status !== 'open') {
+    tieBreak.status = Object.values(tieBreak.awards || {}).every(award => award.winnerCandidateId)
+      ? 'resolved'
+      : 'needs_admin';
+  }
+  return tieBreak;
 }
 
 function publicStatus(config, awards = []) {
@@ -206,9 +244,13 @@ function toResults(candidates, voteCounts = null) {
   return { totalVotes, results, highest, leaders };
 }
 
-function summarizeAward(award, candidates, status) {
+function summarizeAward(award, candidates, status, tieBreak = null) {
   const result = toResults(candidates, award.results || {});
-  const winner = status === 'closed' && result.totalVotes > 0
+  const runoff = tieBreak && tieBreak.awards && tieBreak.awards[award.id];
+  const runoffResult = runoff
+    ? toResults(candidates.filter(candidate => runoff.candidateIds.includes(candidate.id)), runoff.results)
+    : null;
+  let winner = status === 'closed' && result.totalVotes > 0
     ? {
         tie: result.leaders.length > 1,
         candidates: result.leaders.map(candidate => candidate.name),
@@ -217,12 +259,45 @@ function summarizeAward(award, candidates, status) {
         totalVotes: result.totalVotes
       }
     : null;
+  if (runoff && status === 'closed') {
+    if (runoff.winnerCandidateId) {
+      const selected = candidates.find(candidate => candidate.id === runoff.winnerCandidateId);
+      winner = selected ? {
+        tie: false,
+        candidates: [selected.name],
+        votes: Number(runoff.results[selected.id] || 0),
+        percentage: runoffResult.totalVotes
+          ? Number(runoff.results[selected.id] || 0) / runoffResult.totalVotes * 100
+          : 0,
+        totalVotes: runoffResult.totalVotes,
+        tieBreak: true
+      } : winner;
+    } else {
+      const runoffCandidates = candidates.filter(candidate => runoff.candidateIds.includes(candidate.id));
+      winner = {
+        tie: true,
+        candidates: runoffResult.leaders.length
+          ? runoffResult.leaders.map(candidate => candidate.name)
+          : runoffCandidates.map(candidate => candidate.name),
+        votes: runoffResult.highest,
+        percentage: runoffResult.totalVotes
+          ? runoffResult.highest / runoffResult.totalVotes * 100
+          : 0,
+        totalVotes: runoffResult.totalVotes,
+        tieBreakPending: true
+      };
+    }
+  }
   return {
     id: award.id,
     title: award.title,
     totalVotes: result.totalVotes,
     results: result.results,
     currentLeader: result.leaders.map(candidate => candidate.name).join(' / ') || 'No votes yet',
+    tieBreakResults: runoffResult ? runoffResult.results : null,
+    tieBreakCurrentLeader: runoffResult
+      ? runoffResult.leaders.map(candidate => candidate.name).join(' / ') || 'No votes yet'
+      : null,
     winner
   };
 }
@@ -254,25 +329,38 @@ app.get('/api/csrf', (req, res) => {
 
 app.get('/api/public', asyncRoute(async (req, res) => {
   const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const status = publicStatus(config, awards);
-  const limitReached = voteLimitReached(config, awards);
+  const tieBreak = effectiveTieBreak(config, candidates);
+  const tieBreakActive = tieBreak && tieBreak.status === 'open';
+  const status = tieBreakActive ? 'open' : publicStatus(config, awards);
+  const limitReached = !tieBreakActive && voteLimitReached(config, awards);
+  const publicAwards = tieBreakActive
+    ? awards.filter(award => tieBreak.awards[award.id])
+    : awards;
   res.set('Cache-Control', 'no-store');
   res.json({
     status,
-    totalBallots: Number(config.totalBallots || 0),
+    ballotType: tieBreakActive ? 'tiebreak' : 'regular',
+    totalBallots: tieBreakActive
+      ? Number(tieBreak.totalBallots || 0)
+      : Number(config.totalBallots || 0),
     maxVotesPerAward,
     limitReached,
-    awards: awards.map(award => {
-      const summary = summarizeAward(award, candidates, status);
+    awards: publicAwards.map(award => {
+      const runoff = tieBreakActive && tieBreak.awards[award.id];
+      const eligibleCandidates = runoff
+        ? candidates.filter(candidate => runoff.candidateIds.includes(candidate.id))
+        : candidates;
+      const summary = summarizeAward(award, candidates, status, tieBreak);
       return {
         id: summary.id,
         title: summary.title,
-        candidates: candidates.map(({ id, name }) => ({ id, name })),
+        candidates: eligibleCandidates.map(({ id, name }) => ({ id, name })),
         winner: summary.winner
       };
     }),
+    tieBreakActive: Boolean(tieBreakActive),
     startAt: dateToIso(config.startAt),
-    endAt: dateToIso(config.endAt)
+    endAt: tieBreakActive ? dateToIso(tieBreak.endAt) : dateToIso(config.endAt)
   });
 }));
 
@@ -315,8 +403,22 @@ app.use('/api/admin', requireAdmin);
 
 app.get('/api/admin/summary', asyncRoute(async (req, res) => {
   const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const status = publicStatus(config, awards);
-  const awardSummaries = awards.map(award => summarizeAward(award, candidates, status));
+  const tieBreak = effectiveTieBreak(config, candidates);
+  const tieBreakActive = tieBreak && tieBreak.status === 'open';
+  const status = tieBreakActive ? 'open' : publicStatus(config, awards);
+  const awardSummaries = awards.map(award => summarizeAward(award, candidates, status, tieBreak));
+  const unresolvedAwards = tieBreak && tieBreak.status === 'needs_admin'
+    ? Object.entries(tieBreak.awards)
+      .filter(([, tieAward]) => !tieAward.winnerCandidateId)
+      .map(([id, tieAward]) => ({
+        id,
+        title: awards.find(award => award.id === id)?.title || id,
+        candidates: (tieAward.pendingCandidateIds || tieAward.candidateIds).map(candidateId => {
+          const candidate = candidates.find(item => item.id === candidateId);
+          return candidate ? { id: candidate.id, name: candidate.name } : null;
+        }).filter(Boolean)
+      }))
+    : [];
   res.set('Cache-Control', 'no-store');
   res.json({
     totalVotes: Number(config.totalBallots || 0),
@@ -325,6 +427,12 @@ app.get('/api/admin/summary', asyncRoute(async (req, res) => {
     status,
     hasStarted: Boolean(config.hasStarted),
     awards: awardSummaries,
+    tieBreak: tieBreak ? {
+      status: tieBreak.status,
+      endAt: dateToIso(tieBreak.endAt),
+      totalBallots: Number(tieBreak.totalBallots || 0),
+      unresolvedAwards
+    } : null,
     startAt: dateToIso(config.startAt),
     endAt: dateToIso(config.endAt)
   });
@@ -433,6 +541,9 @@ app.put('/api/admin/schedule', requireCsrf, asyncRoute(async (req, res) => {
   await db.runTransaction(async transaction => {
     const configSnapshot = await transaction.get(configRef);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
+    if (configSnapshot.data().tieBreak) {
+      throw new HttpError(409, 'The schedule cannot be changed after a tie-break runoff has started.');
+    }
     if (publicStatus(configSnapshot.data()) === 'open') {
       throw new HttpError(409, 'Close voting before changing its schedule.');
     }
@@ -447,10 +558,119 @@ app.put('/api/admin/schedule', requireCsrf, asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
+app.post('/api/admin/tiebreak/start', requireCsrf, asyncRoute(async (req, res) => {
+  const durationMinutes = req.body.durationMinutes;
+  if (!votingDurationOptions.includes(durationMinutes)) {
+    return res.status(400).json({ error: 'Choose a voting duration of 5, 10, 15, or 20 minutes.' });
+  }
+  const roundId = crypto.randomBytes(12).toString('hex');
+  let endAt = null;
+  await db.runTransaction(async transaction => {
+    const [configSnapshot, candidatesSnapshot, awardsSnapshot] = await Promise.all([
+      transaction.get(configRef),
+      transaction.get(candidatesRef.orderBy('sortOrder')),
+      transaction.get(awardsRef.orderBy('sortOrder'))
+    ]);
+    if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
+    const config = configSnapshot.data();
+    const awards = awardsSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
+    if (publicStatus(config, awards) === 'open') {
+      throw new HttpError(409, 'Close the main voting before starting a tie-break runoff.');
+    }
+    if (config.tieBreak) throw new HttpError(409, 'A tie-break runoff has already been started for this election.');
+
+    const candidates = candidatesSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
+    const tiedAwards = {};
+    awards.forEach(award => {
+      const result = toResults(candidates, award.results || {});
+      if (result.leaders.length > 1) {
+        tiedAwards[award.id] = {
+          candidateIds: result.leaders.map(candidate => candidate.id),
+          results: Object.fromEntries(result.leaders.map(candidate => [candidate.id, 0]))
+        };
+      }
+    });
+    if (!Object.keys(tiedAwards).length) {
+      throw new HttpError(409, 'There are no tied awards that need a runoff.');
+    }
+
+    endAt = Timestamp.fromDate(new Date(Date.now() + durationMinutes * 60 * 1000));
+    transaction.update(configRef, {
+      tieBreak: {
+        roundId,
+        status: 'open',
+        endAt,
+        totalBallots: 0,
+        awards: tiedAwards
+      },
+      isOpen: true,
+      endAt,
+      updatedAt: FieldValue.serverTimestamp()
+    });
+  });
+  scheduleAutoClose(endAt);
+  res.json({ ok: true, endAt: dateToIso(endAt) });
+}));
+
+app.post('/api/admin/tiebreak/resolve', requireCsrf, asyncRoute(async (req, res) => {
+  const winners = req.body.winners;
+  if (!winners || typeof winners !== 'object' || Array.isArray(winners)) {
+    return res.status(400).json({ error: 'Choose a winner for each tied award.' });
+  }
+  await db.runTransaction(async transaction => {
+    const [configSnapshot, candidatesSnapshot] = await Promise.all([
+      transaction.get(configRef),
+      transaction.get(candidatesRef)
+    ]);
+    if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
+    const candidates = candidatesSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
+    const config = configSnapshot.data();
+    const tieBreak = effectiveTieBreak(config, candidates);
+    if (!tieBreak || tieBreak.status === 'open') {
+      throw new HttpError(409, 'Finish the tie-break runoff before selecting winners.');
+    }
+    if (tieBreak.status === 'resolved') {
+      throw new HttpError(409, 'All tie-break winners have already been determined.');
+    }
+    const unresolvedIds = Object.entries(tieBreak.awards)
+      .filter(([, award]) => !award.winnerCandidateId)
+      .map(([id]) => id);
+    if (Object.keys(winners).length !== unresolvedIds.length ||
+        Object.keys(winners).some(id => !unresolvedIds.includes(id))) {
+      throw new HttpError(400, 'Choose exactly one winner for every award still tied after the runoff.');
+    }
+    unresolvedIds.forEach(id => {
+      const award = tieBreak.awards[id];
+      const candidateId = winners[id];
+      if (typeof candidateId !== 'string' ||
+          !(award.pendingCandidateIds || award.candidateIds).includes(candidateId) ||
+          !candidates.some(candidate => candidate.id === candidateId)) {
+        throw new HttpError(400, 'Choose a valid tied nominee for each award.');
+      }
+      award.winnerCandidateId = candidateId;
+    });
+    tieBreak.status = 'resolved';
+    tieBreak.resolvedBy = req.session.adminUsername || req.session.adminId;
+    tieBreak.resolvedAt = FieldValue.serverTimestamp();
+    transaction.update(configRef, {
+      tieBreak,
+      isOpen: false,
+      endAt: null,
+      updatedAt: FieldValue.serverTimestamp()
+    });
+  });
+  scheduleAutoClose(null);
+  res.json({ ok: true });
+}));
+
 app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) => {
   const action = req.params.action;
   if (!['start', 'close', 'reopen'].includes(action)) {
     return res.status(404).json({ error: 'Unknown voting action.' });
+  }
+  const durationMinutes = req.body.durationMinutes;
+  if (action !== 'close' && !votingDurationOptions.includes(durationMinutes)) {
+    return res.status(400).json({ error: 'Choose a voting duration of 5, 10, 15, or 20 minutes.' });
   }
   let endAt = null;
   await db.runTransaction(async transaction => {
@@ -461,6 +681,9 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
+    if (action !== 'close' && config.tieBreak) {
+      throw new HttpError(409, 'Main voting cannot be reopened after a tie-break runoff has started. Reset the election to start over.');
+    }
     if (action !== 'close' && voteLimitReached(config, awards.docs.map(award => award.data()))) {
       throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
@@ -473,8 +696,20 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
     if (action !== 'close' && config.startAt && Date.now() < timestampMillis(config.startAt)) {
       throw new HttpError(409, 'Voting cannot open before its configured start date.');
     }
-    if (action === 'start' || action === 'reopen') {
-      endAt = Timestamp.fromDate(new Date(Date.now() + votingDurationMs));
+    if (action === 'close' && config.tieBreak) {
+      const currentCandidates = candidates.docs.map(document => ({ id: document.id, ...document.data() }));
+      const tieBreak = effectiveTieBreak({
+        ...config,
+        tieBreak: { ...config.tieBreak, status: 'needs_admin' }
+      }, currentCandidates);
+      transaction.update(configRef, {
+        tieBreak,
+        isOpen: false,
+        endAt: null,
+        updatedAt: FieldValue.serverTimestamp()
+      });
+    } else if (action === 'start' || action === 'reopen') {
+      endAt = Timestamp.fromDate(new Date(Date.now() + durationMinutes * 60 * 1000));
       transaction.update(configRef, {
         isOpen: true,
         hasStarted: true,
@@ -509,6 +744,7 @@ app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
       hasStarted: false,
       totalBallots: 0,
       endAt: null,
+      tieBreak: FieldValue.delete(),
       updatedAt: FieldValue.serverTimestamp()
     });
   });
@@ -521,24 +757,49 @@ app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/admin/export.csv', asyncRoute(async (req, res) => {
-  const [candidates, awards] = await Promise.all([getCandidates(), getAwards()]);
+  const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
+  const tieBreak = effectiveTieBreak(config, candidates);
+  const status = tieBreak && tieBreak.status === 'open' ? 'open' : publicStatus(config, awards);
   const quote = value => {
     const safeValue = typeof value === 'string' && /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
     return `"${String(safeValue).replace(/"/g, '""')}"`;
   };
   const lines = [
-    ['Award', 'Candidate name', 'Votes', 'Percentage'].map(quote).join(',')
+    ['Round', 'Award', 'Candidate name', 'Votes', 'Percentage', 'Final winner'].map(quote).join(',')
   ];
   awards.forEach(award => {
+    const summary = summarizeAward(award, candidates, status, tieBreak);
+    const finalWinner = summary.winner && !summary.winner.tie && !summary.winner.tieBreakPending
+      ? summary.winner.candidates[0]
+      : '';
     const result = toResults(candidates, award.results || {});
     result.results.forEach(candidate => {
       lines.push([
+        'Main',
         award.title,
         candidate.name,
         candidate.votes,
-        candidate.percentage.toFixed(2) + '%'
+        candidate.percentage.toFixed(2) + '%',
+        finalWinner
       ].map(quote).join(','));
     });
+    const runoff = tieBreak && tieBreak.awards[award.id];
+    if (runoff) {
+      const runoffResult = toResults(
+        candidates.filter(candidate => runoff.candidateIds.includes(candidate.id)),
+        runoff.results
+      );
+      runoffResult.results.forEach(candidate => {
+        lines.push([
+          'Tie-break',
+          award.title,
+          candidate.name,
+          candidate.votes,
+          candidate.percentage.toFixed(2) + '%',
+          finalWinner
+        ].map(quote).join(','));
+      });
+    }
   });
   res.set({
     'Content-Type': 'text/csv; charset=utf-8',
@@ -561,21 +822,86 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
   if (!selections || typeof selections !== 'object' || Array.isArray(selections)) {
     return res.status(400).json({ error: 'Choose one candidate for every award.' });
   }
-  if (Object.keys(selections).length !== requiredAwardCount) {
-    return res.status(400).json({ error: `Select one nominee for all ${requiredAwardCount} awards before submitting.` });
-  }
-  const limitReached = await db.runTransaction(async transaction => {
+  const result = await db.runTransaction(async transaction => {
     const configSnapshot = await transaction.get(configRef);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
-    if (Number(config.totalBallots || 0) >= maxVotesPerAward) {
-      throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
-    }
-
     const [awardSnapshot, candidateSnapshot] = await Promise.all([
       transaction.get(awardsRef.orderBy('sortOrder')),
       transaction.get(candidatesRef.orderBy('sortOrder'))
     ]);
+    const candidateIds = new Set(candidateSnapshot.docs.map(candidate => candidate.id));
+    const candidateData = candidateSnapshot.docs.map(candidate => ({ id: candidate.id, ...candidate.data() }));
+    const inTieBreak = tieBreakOpen(config);
+    if (inTieBreak) {
+      const runoffAwards = config.tieBreak.awards || {};
+      const runoffAwardIds = Object.keys(runoffAwards);
+      if (Object.keys(selections).length !== runoffAwardIds.length ||
+          Object.keys(selections).some(id => !Object.prototype.hasOwnProperty.call(runoffAwards, id))) {
+        throw new HttpError(400, 'Choose one tied nominee for every award in this runoff.');
+      }
+      const ballot = {};
+      for (const awardId of runoffAwardIds) {
+        const candidateId = selections[awardId];
+        if (typeof candidateId !== 'string' || !validDocumentId(candidateId) ||
+            !runoffAwards[awardId].candidateIds.includes(candidateId) || !candidateIds.has(candidateId)) {
+          throw new HttpError(400, 'Choose a valid tied nominee for every award.');
+        }
+        ballot[awardId] = candidateId;
+      }
+      const voterKey = crypto.createHash('sha256')
+        .update(`${config.tieBreak.roundId}:${voterName.toLowerCase('en-US')}`)
+        .digest('hex');
+      const voterRef = db.collection('voters').doc(voterKey);
+      const voterSnapshot = await transaction.get(voterRef);
+      if (voterSnapshot.exists) throw new HttpError(409, 'This voter name has already submitted a tie-break ballot.');
+
+      let nextTieBreak = copyTieBreak(config.tieBreak);
+      Object.entries(ballot).forEach(([awardId, candidateId]) => {
+        nextTieBreak.awards[awardId].results[candidateId] =
+          Number(nextTieBreak.awards[awardId].results[candidateId] || 0) + 1;
+      });
+      nextTieBreak.totalBallots = Number(nextTieBreak.totalBallots || 0) + 1;
+      const limitReached = Object.values(nextTieBreak.awards).some(award =>
+        Object.values(award.results).reduce((sum, votes) => sum + Number(votes || 0), 0) >= maxVotesPerAward
+      );
+      if (limitReached) {
+        nextTieBreak.status = 'needs_admin';
+        nextTieBreak = effectiveTieBreak({ tieBreak: nextTieBreak }, candidateData);
+      }
+
+      const voteRef = db.collection('votes').doc(crypto.randomBytes(16).toString('hex'));
+      transaction.create(voteRef, {
+        voterName,
+        ballotType: 'tiebreak',
+        tieBreakRoundId: config.tieBreak.roundId,
+        selections: ballot,
+        createdAt: FieldValue.serverTimestamp()
+      });
+      transaction.create(voterRef, {
+        name: voterName,
+        ballotType: 'tiebreak',
+        tieBreakRoundId: config.tieBreak.roundId,
+        createdAt: FieldValue.serverTimestamp()
+      });
+      transaction.update(configRef, {
+        tieBreak: nextTieBreak,
+        ...(limitReached ? {
+          isOpen: false,
+          endAt: null,
+          updatedAt: FieldValue.serverTimestamp()
+        } : {})
+      });
+      return { limitReached, ballotType: 'tiebreak', awardsVoted: runoffAwardIds.length };
+    }
+
+    if (config.tieBreak) throw new HttpError(409, 'The tie-break runoff is closed.');
+    if (Object.keys(selections).length !== requiredAwardCount) {
+      throw new HttpError(400, `Select one nominee for all ${requiredAwardCount} awards before submitting.`);
+    }
+    if (Number(config.totalBallots || 0) >= maxVotesPerAward) {
+      throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
+    }
     if (awardSnapshot.size !== requiredAwardCount || candidateSnapshot.size !== 3) {
       throw new HttpError(409, 'The six-award ballot is not ready for voting.');
     }
@@ -584,7 +910,6 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
     if (publicStatus(config, awardData) !== 'open') throw new HttpError(409, 'Voting is currently closed.');
-    const candidateIds = new Set(candidateSnapshot.docs.map(candidate => candidate.id));
     const awardIds = new Set(awardSnapshot.docs.map(award => award.id));
     if (Object.keys(selections).some(id => !awardIds.has(id))) {
       throw new HttpError(400, 'The ballot contains an unknown award.');
@@ -593,9 +918,6 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       !Object.prototype.hasOwnProperty.call(selections, award.id)
     );
     if (missingAward) throw new HttpError(400, `Choose one candidate for ${missingAward.get('title')}.`);
-    if (Object.keys(selections).length !== requiredAwardCount) {
-      throw new HttpError(400, `Choose exactly one candidate for each of the ${requiredAwardCount} awards.`);
-    }
     const ballot = {};
     for (const award of awardSnapshot.docs) {
       const candidateId = selections[award.id];
@@ -636,10 +958,10 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
         updatedAt: FieldValue.serverTimestamp()
       } : {})
     });
-    return limitWillBeReached;
+    return { limitReached: limitWillBeReached, ballotType: 'regular', awardsVoted: requiredAwardCount };
   });
-  if (limitReached) scheduleAutoClose(null);
-  res.json({ ok: true, awardsVoted: requiredAwardCount, limitReached });
+  if (result.limitReached) scheduleAutoClose(null);
+  res.json({ ok: true, ...result });
 }));
 
 app.use(express.static(path.join(__dirname, 'dist'), { index: false }));

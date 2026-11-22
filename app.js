@@ -6,6 +6,7 @@ let csrfToken = '';
 let adminUsername = '';
 let pendingVote = null;
 let ballotSubmitted = false;
+let ballotSubmittedType = '';
 let toastTimer;
 let pollTimer;
 let closeTimer;
@@ -114,14 +115,16 @@ async function renderPublic(errorMessage = '') {
     const data = await api('/api/public');
     setStatus(data.status, data.endAt);
     const awards = Array.isArray(data.awards) ? data.awards : [];
-    const votingReady = awards.length === 6 && awards.every(award => award.candidates.length === 3);
-    if (ballotSubmitted) {
+    const votingReady = data.tieBreakActive
+      ? awards.length > 0 && awards.every(award => award.candidates.length >= 2)
+      : awards.length === 6 && awards.every(award => award.candidates.length === 3);
+    if (ballotSubmitted && ballotSubmittedType === (data.tieBreakActive ? 'tiebreak' : 'regular')) {
       main.innerHTML = `
-        <section class="hero"><span class="eyebrow">YOUR SIX-AWARD BALLOT</span><h1>Thank you for voting.</h1></section>
+        <section class="hero"><span class="eyebrow">${data.tieBreakActive ? 'TIE-BREAK BALLOT' : 'YOUR SIX-AWARD BALLOT'}</span><h1>Thank you for voting.</h1></section>
         <section class="panel success-panel">
           <div class="success-icon" aria-hidden="true">✓</div>
-          <h2>Your ballot has been recorded.</h2>
-          <p class="muted">The voter name and ballot were recorded. ${data.totalBallots} of ${data.maxVotesPerAward} ballots have been submitted.</p>
+          <h2>${data.tieBreakActive ? 'Your tie-break ballot has been recorded.' : 'Your ballot has been recorded.'}</h2>
+          <p class="muted">${data.totalBallots} ${data.totalBallots === 1 ? 'ballot has' : 'ballots have'} been submitted${data.tieBreakActive ? ' in this runoff' : ''}.</p>
           ${data.limitReached ? '<p class="field-help">The maximum vote count has been reached for every award.</p>' : ''}
         </section>`;
       return;
@@ -133,11 +136,18 @@ async function renderPublic(errorMessage = '') {
             return `<article class="panel award-outcome"><span class="eyebrow">NO VOTES</span><h2>${escapeHtml(award.title)}</h2><p class="muted">No winner was determined.</p></article>`;
           }
           const winner = award.winner;
+          const winnerLabel = winner.tieBreakPending
+            ? 'RUNOFF TIED · ADMIN DECISION PENDING'
+            : winner.tieBreak
+              ? 'TIE-BREAK WINNER'
+              : winner.tie
+                ? 'RUNOFF REQUIRED'
+                : 'WINNER ANNOUNCEMENT';
           return `<article class="panel award-outcome">
-            <span class="eyebrow">${winner.tie ? 'FINAL RESULT · TIE' : 'WINNER ANNOUNCEMENT'}</span>
+            <span class="eyebrow">${winnerLabel}</span>
             <h2>${escapeHtml(award.title)}</h2>
             <p class="award-winner-name">${winner.candidates.map(escapeHtml).join(' &amp; ')}</p>
-            <p class="muted">${winner.votes} ${winner.votes === 1 ? 'vote' : 'votes'}${winner.tie ? ' each' : ''} · ${winner.percentage.toFixed(1)}%${winner.tie ? ' each' : ''}</p>
+            <p class="muted">${winner.tieBreakPending ? 'The runoff did not break the tie. An administrator will select one winner.' : `${winner.votes} ${winner.votes === 1 ? 'vote' : 'votes'}${winner.tie ? ' each' : ''} · ${winner.percentage.toFixed(1)}%${winner.tie ? ' each' : ''}`}</p>
           </article>`;
         }).join('')}</section>`
       : data.status === 'closed'
@@ -156,9 +166,9 @@ async function renderPublic(errorMessage = '') {
       </fieldset>`).join('');
     main.innerHTML = `
       <section class="hero">
-        <span class="eyebrow">SIX AWARDS · ONE BALLOT</span>
-        <h1>Award Voting</h1>
-        <p>${data.status === 'open' ? 'Choose one nominee for each award, then submit your ballot.' : 'Voting is not currently accepting ballots.'}</p>
+        <span class="eyebrow">${data.tieBreakActive ? 'TIE-BREAK RUNOFF' : 'SIX AWARDS · ONE BALLOT'}</span>
+        <h1>${data.tieBreakActive ? 'Break the tie' : 'Award Voting'}</h1>
+        <p>${data.tieBreakActive ? 'Choose one of the tied nominees for each award in this runoff.' : data.status === 'open' ? 'Choose one nominee for each award, then submit your ballot.' : 'Voting is not currently accepting ballots.'}</p>
       </section>
       ${countdownMarkup(data.status, data.endAt)}
       ${winnerMarkup}
@@ -171,12 +181,12 @@ async function renderPublic(errorMessage = '') {
             <label for="voter-name">Full name of voter</label>
             <input id="voter-name" type="text" autocomplete="name" minlength="3" maxlength="120" required>
           </div>
-          <p class="field-help">Enter your first and last name. Each full name may submit one ballot; voting stops after 55 ballots.</p>
+          <p class="field-help">${data.tieBreakActive ? 'Enter your first and last name. Each full name may submit one ballot in this runoff.' : 'Enter your first and last name. Each full name may submit one ballot; voting stops after 55 ballots.'}</p>
         </section>
         ${ballot}
-        <div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Enter your name and choose one nominee for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>Submit all six choices (0/6)</button></div>
+        <div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Enter your name and choose one nominee for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>${data.tieBreakActive ? 'Submit tie-break choices' : 'Submit all six choices (0/6)'}</button></div>
       </form>` : ''}
-      <div class="vote-note"><span><strong>Maximum 55 votes per award.</strong> ${Number(data.totalBallots || 0)} of ${data.maxVotesPerAward} complete ballots submitted. One ballot is allowed per full name; the limit is enforced by the server.</span></div>
+      <div class="vote-note"><span>${data.tieBreakActive ? `<strong>Tie-break runoff.</strong> ${Number(data.totalBallots || 0)} runoff ballots submitted. Each full name may vote once in this runoff.` : `<strong>Maximum 55 votes per award.</strong> ${Number(data.totalBallots || 0)} of ${data.maxVotesPerAward} complete ballots submitted. One ballot is allowed per full name; the limit is enforced by the server.`}</span></div>
       <div class="inline-actions" style="justify-content:center;margin-top:18px"><a class="muted" href="#login" style="font-size:12px">Administrator sign in</a></div>`;
 
     const ballotForm = document.getElementById('ballot-form');
@@ -193,14 +203,18 @@ async function renderPublic(errorMessage = '') {
         const nameParts = normalizedName.split(' ');
         const hasName = nameParts.length >= 2 && normalizedName.length >= 3;
         submitButton.disabled = missingAwards.length > 0 || !hasName || data.status !== 'open' || !votingReady;
-        submitButton.textContent = `Submit all six choices (${selectedCount}/${awards.length})`;
+        submitButton.textContent = data.tieBreakActive
+          ? `Submit tie-break choices (${selectedCount}/${awards.length})`
+          : `Submit all six choices (${selectedCount}/${awards.length})`;
         validationMessage.textContent = data.status !== 'open'
           ? 'Voting is closed.'
           : !hasName
             ? 'Enter the voter’s full name.'
             : missingAwards.length
               ? `Choose one name for each remaining award: ${missingAwards.map(award => award.title).join(', ')}.`
-              : 'All six awards are selected. Review your choices before submitting.';
+              : data.tieBreakActive
+                ? 'All tied awards are selected. Review your choices before submitting.'
+                : 'All six awards are selected. Review your choices before submitting.';
       };
       ballotForm.addEventListener('change', updateBallotButton);
       voterNameInput.addEventListener('input', updateBallotButton);
@@ -214,14 +228,18 @@ async function renderPublic(errorMessage = '') {
         }));
         if (nameParts.length < 2 || voterName.length < 3 ||
             Object.values(selections).some(candidateId => !candidateId)) return;
-        pendingVote = { voterName, selections };
+        pendingVote = { voterName, selections, ballotType: data.ballotType };
         const chosenNames = awards.map(award => {
           const candidate = award.candidates.find(item => item.id === selections[award.id]);
           return `${award.title}: ${candidate ? candidate.name : ''}`;
         });
-        document.getElementById('confirm-title').textContent = 'Submit your six-award ballot?';
+        document.getElementById('confirm-title').textContent = data.tieBreakActive
+          ? 'Submit your tie-break ballot?'
+          : 'Submit your six-award ballot?';
         document.getElementById('confirm-copy').textContent = [`Voter: ${voterName}`, ...chosenNames].join(' · ');
-        document.getElementById('confirm-submit').textContent = 'Confirm all six choices';
+        document.getElementById('confirm-submit').textContent = data.tieBreakActive
+          ? 'Confirm tie-break choices'
+          : 'Confirm all six choices';
         dialog.returnValue = 'cancel';
         dialog.showModal();
       });
@@ -242,8 +260,9 @@ async function submitVote() {
   const vote = pendingVote;
   pendingVote = null;
   try {
-    await api('/api/vote', { method: 'POST', body: vote });
+    const result = await api('/api/vote', { method: 'POST', body: vote });
     ballotSubmitted = true;
+    ballotSubmittedType = result.ballotType;
     await renderPublic();
   } catch (error) {
     await renderPublic(error.message);
@@ -313,11 +332,12 @@ function scheduleLine(summary) {
 function awardOutcomeCards(awards, status) {
   return `<div class="award-outcomes">${awards.map(award => {
     if (status === 'open') {
+      const runoffIsActive = Boolean(award.tieBreakResults);
       return `<article class="panel award-outcome">
-        <span class="eyebrow">CURRENT LEADER</span>
+        <span class="eyebrow">${runoffIsActive ? 'TIE-BREAK RUNOFF LEADER' : 'CURRENT LEADER'}</span>
         <h2>${escapeHtml(award.title)}</h2>
-        <p class="award-winner-name">${escapeHtml(award.currentLeader)}</p>
-        <p class="muted">A final winner will be announced after voting closes.</p>
+        <p class="award-winner-name">${escapeHtml(runoffIsActive ? award.tieBreakCurrentLeader : award.currentLeader)}</p>
+        <p class="muted">${runoffIsActive ? 'A unique runoff leader becomes the final winner.' : 'A final winner will be announced after voting closes.'}</p>
       </article>`;
     }
     if (!award.winner) {
@@ -328,10 +348,10 @@ function awardOutcomeCards(awards, status) {
       </article>`;
     }
     return `<article class="panel award-outcome">
-      <span class="eyebrow">${award.winner.tie ? 'FINAL RESULT · TIE' : 'WINNER ANNOUNCEMENT'}</span>
+      <span class="eyebrow">${award.winner.tieBreakPending ? 'RUNOFF TIED · ADMIN DECISION PENDING' : award.winner.tieBreak ? 'TIE-BREAK WINNER' : award.winner.tie ? 'RUNOFF REQUIRED' : 'WINNER ANNOUNCEMENT'}</span>
       <h2>${escapeHtml(award.title)}</h2>
       <p class="award-winner-name">${award.winner.candidates.map(escapeHtml).join(' &amp; ')}</p>
-      <p class="muted">${award.winner.votes} ${award.winner.tie ? 'votes each' : award.winner.votes === 1 ? 'vote' : 'votes'} · ${award.winner.percentage.toFixed(1)}%${award.winner.tie ? ' each' : ''}</p>
+      <p class="muted">${award.winner.tieBreakPending ? 'The runoff did not break the tie. An administrator will select one winner.' : `${award.winner.votes} ${award.winner.tie ? 'votes each' : award.winner.votes === 1 ? 'vote' : 'votes'} · ${award.winner.percentage.toFixed(1)}%${award.winner.tie ? ' each' : ''}`}</p>
     </article>`;
   }).join('')}</div>`;
 }
@@ -342,6 +362,7 @@ function awardResultPanels(awards) {
       <h2>${escapeHtml(award.title)}</h2>
       ${resultRows(award.results)}
       <div class="chart-wrap"><h3 class="chart-heading">Results chart</h3>${chartSvg(award.results)}</div>
+      ${award.tieBreakResults ? `<h3 class="chart-heading">Tie-break runoff results</h3>${resultRows(award.tieBreakResults)}` : ''}
     </section>`).join('')}</div>`;
 }
 
@@ -384,10 +405,34 @@ async function renderAdmin(view = 'dashboard') {
         <section class="vote-note"><span>Exactly three candidates are required. The same three names appear under each of the six awards.</span></section>`;
     } else if (view === 'voting') {
       const ballotReady = summary.candidateCount === 3 && summary.awardCount === 6;
+      const tiedAwards = summary.awards.filter(award => award.winner && award.winner.tie && !award.winner.tieBreakPending);
       const actionButton = summary.status === 'open'
-        ? '<button id="close-voting" class="button button-danger">Finish voting</button>'
-        : `<button id="start-voting" class="button button-primary" ${!ballotReady ? 'disabled' : ''}>${summary.hasStarted ? 'Reopen for 10 minutes' : 'Start 10-minute voting'}</button>`;
-      content = `${pageHeading('Voting management', 'Each start or reopen opens the ballot for exactly 10 minutes.')}
+        ? `<button id="close-voting" type="button" class="button button-danger">${summary.tieBreak && summary.tieBreak.status === 'open' ? 'Finish tie-break runoff' : 'Finish voting'}</button>`
+        : summary.tieBreak
+          ? ''
+          : `<button id="start-voting" type="button" class="button button-primary" ${!ballotReady ? 'disabled' : ''}>${summary.hasStarted ? 'Reopen voting' : 'Start voting'}</button>`;
+      const tieBreakButton = summary.status !== 'open' && !summary.tieBreak && tiedAwards.length
+        ? `<button id="start-tiebreak" type="button" class="button button-primary">Start runoff for ${tiedAwards.length} tied ${tiedAwards.length === 1 ? 'award' : 'awards'}</button>`
+        : '';
+      const tieBreakResolution = summary.tieBreak && summary.tieBreak.status === 'needs_admin'
+        ? `<section class="panel" style="margin-top:16px">
+            <h2>Resolve awards still tied</h2>
+            <p class="muted">The runoff did not produce a unique leader for these awards. Select one tied nominee for each to finalize the winners.</p>
+            <form id="resolve-tiebreak-form">
+              ${summary.tieBreak.unresolvedAwards.map(award => `<div class="field">
+                <label for="tie-winner-${escapeHtml(award.id)}">${escapeHtml(award.title)}</label>
+                <select id="tie-winner-${escapeHtml(award.id)}" data-award-id="${escapeHtml(award.id)}" required>
+                  <option value="">Choose one winner</option>
+                  ${award.candidates.map(candidate => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(candidate.name)}</option>`).join('')}
+                </select>
+              </div>`).join('')}
+              <button class="button button-primary" type="submit">Finalize winners</button>
+            </form>
+          </section>`
+        : summary.tieBreak && summary.tieBreak.status === 'resolved'
+          ? '<section class="vote-note" style="margin-top:16px"><span>All tied awards have one final winner.</span></section>'
+          : '';
+      content = `${pageHeading('Voting management', 'Choose how long voting stays open each time you start or reopen it.')}
         <div class="stats-grid">
           <article class="stat-card"><div class="stat-label">STATUS</div><div class="stat-value small">${summary.status === 'open' ? 'Open' : 'Closed'}</div></article>
           <article class="stat-card"><div class="stat-label">AWARDS</div><div class="stat-value">${summary.awardCount} / 6</div></article>
@@ -397,19 +442,21 @@ async function renderAdmin(view = 'dashboard') {
         ${!ballotReady ? '<div class="alert" role="alert">The ballot needs exactly six awards and three candidates before voting can open.</div>' : ''}
         <section class="panel">
           <h2>Voting start and duration</h2>
-          <p class="muted">Times use your browser's local time zone. Set an optional start time; voting automatically closes 10 minutes after it opens.</p>
+          <p class="muted">${summary.tieBreak && summary.tieBreak.status === 'open' ? 'The tie-break runoff is open; voters can select only among nominees tied for each award.' : "Times use your browser's local time zone. Set an optional start time and choose a duration; voting closes automatically when the timer expires."}</p>
           <form id="schedule-form">
             <div class="form-row">
               <div class="field"><label for="start-at">Voting starts</label><input id="start-at" type="datetime-local" value="${localInputValue(summary.startAt)}" ${summary.status === 'open' ? 'disabled' : ''}></div>
-              <div class="field"><label>Voting duration</label><div class="field-value">10 minutes after opening</div></div>
+              <div class="field"><label for="voting-duration">Voting duration</label><select id="voting-duration" ${summary.status === 'open' ? 'disabled' : ''}><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="15">15 minutes</option><option value="20">20 minutes</option></select></div>
             </div>
-            <div class="inline-actions"><button class="button button-secondary" type="submit" ${summary.status === 'open' ? 'disabled' : ''}>Save dates</button>${actionButton}</div>
+            <div class="inline-actions"><button class="button button-secondary" type="submit" ${summary.status === 'open' || summary.tieBreak ? 'disabled' : ''}>Save dates</button>${actionButton}${tieBreakButton}</div>
           </form>
           ${scheduleLine(summary)}
         </section>
+        ${summary.tieBreak && summary.tieBreak.status === 'open' ? `<section class="vote-note" style="margin-top:16px"><span>${summary.tieBreak.totalBallots} tie-break ballots submitted. Results remain limited to tied nominees.</span></section>` : ''}
+        ${tieBreakResolution}
         <section class="panel" style="margin-top:16px">
           <h2>Reset election</h2>
-          <p class="muted">Permanently remove every six-award ballot and clear the vote totals. Voting will be closed, and award and candidate names will be unlocked.</p>
+          <p class="muted">Permanently remove all ballots and clear the vote totals. Voting will be closed, and award and candidate names will be unlocked.</p>
           <button id="reset-election" class="button button-danger">Reset all votes</button>
         </section>`;
     } else if (view === 'results') {
@@ -509,7 +556,23 @@ function bindAdminActions(view) {
     } catch (error) { showToast(error.message); }
   });
   const start = document.getElementById('start-voting');
-  if (start) start.addEventListener('click', () => changeVoting('start', 'Start voting now?'));
+  if (start) start.addEventListener('click', () => {
+    const durationMinutes = Number(document.getElementById('voting-duration').value);
+    changeVoting('start', `Start voting for ${durationMinutes} minutes?`, durationMinutes);
+  });
+  const startTieBreak = document.getElementById('start-tiebreak');
+  if (startTieBreak) startTieBreak.addEventListener('click', async () => {
+    const durationMinutes = Number(document.getElementById('voting-duration').value);
+    if (!window.confirm(`Start a ${durationMinutes}-minute runoff for the tied awards?`)) return;
+    try {
+      await api('/api/admin/tiebreak/start', {
+        method: 'POST',
+        body: { durationMinutes }
+      });
+      showToast('Tie-break runoff started.');
+      renderAdmin('voting');
+    } catch (error) { showToast(error.message); }
+  });
   const close = document.getElementById('close-voting');
   if (close) close.addEventListener('click', () => changeVoting('close', 'Finish voting now? New ballots will no longer be accepted.'));
   const finish = document.getElementById('finish-voting');
@@ -523,16 +586,30 @@ function bindAdminActions(view) {
       renderAdmin('voting');
     } catch (error) { showToast(error.message); }
   });
+  const tieBreakForm = document.getElementById('resolve-tiebreak-form');
+  if (tieBreakForm) tieBreakForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const winners = Object.fromEntries([...tieBreakForm.querySelectorAll('select[data-award-id]')]
+      .map(select => [select.dataset.awardId, select.value]));
+    try {
+      await api('/api/admin/tiebreak/resolve', { method: 'POST', body: { winners } });
+      showToast('Tie-break winners finalized.');
+      renderAdmin('voting');
+    } catch (error) { showToast(error.message); }
+  });
   const exportButton = document.getElementById('export-results');
   if (exportButton) exportButton.addEventListener('click', () => { window.location.href = '/api/admin/export.csv'; });
   const refresh = document.getElementById('refresh-dashboard');
   if (refresh) refresh.addEventListener('click', () => renderAdmin(view));
 }
 
-async function changeVoting(action, prompt) {
+async function changeVoting(action, prompt, durationMinutes) {
   if (!window.confirm(prompt)) return;
   try {
-    await api(`/api/admin/voting/${action}`, { method: 'POST', body: {} });
+    await api(`/api/admin/voting/${action}`, {
+      method: 'POST',
+      body: durationMinutes === undefined ? {} : { durationMinutes }
+    });
     showToast(action === 'close' ? 'Voting closed.' : 'Voting is open.');
     renderAdmin(action === 'close' ? 'dashboard' : 'voting');
   } catch (error) { showToast(error.message); }

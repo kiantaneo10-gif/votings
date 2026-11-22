@@ -70,13 +70,14 @@ The server validates each ballot and full name and writes the voter identifier, 
 
 - Administrators sign in from the public page's **Administrator sign in** link.
 - Rename the six default awards and replace the three nominee names before starting. Award and candidate management become locked after voting starts; reset the election to edit them again.
-- Optionally schedule a start date while the election is closed. Every start or reopen creates a 10-minute voting window; the server automatically closes voting at the deadline and rejects any later submissions.
+- Optionally schedule a start date while the election is closed. Choose a 5-, 10-, 15-, or 20-minute voting window each time voting starts or reopens; the server automatically closes voting at the deadline and rejects any later submissions.
 - Exactly six awards and three candidates are required to start voting. All three nominees appear under each award.
 - Voters enter a first and last name, choose one nominee for each award, and submit one complete ballot. The normalized full name may submit only one ballot.
 - The server accepts no more than 55 complete ballots. Because each ballot contains one choice per award, this caps each award at 55 votes; the server closes voting as soon as the limit is reached.
-- The administrator can rename awards from **Awards** and finish voting early from **Overview** or **Voting management**. Otherwise it closes automatically after 10 minutes. The overview and **Winner announcement** views then show the winner or tie for each award; while voting is open, they show current leaders only.
+- If an award is tied after voting closes, the administrator can start a timed runoff for the tied awards only. Voters choose among the nominees tied for each award; the 55-vote cap applies to each tied award, and each full name may vote once in the runoff, including voters who participated in the main election. A unique runoff leader becomes the winner. If a runoff remains tied or gets no votes, the administrator selects one of the tied nominees.
+- The administrator can rename awards from **Awards** and finish voting early from **Overview** or **Voting management**. Otherwise voting closes automatically when the selected duration expires. The overview and **Winner announcement** views show the winner or the pending tie-break state; while voting is open, they show current leaders only.
 - The voter page and administrator pages display a live countdown based on the election deadline saved by the server.
-- Results refresh every 10 seconds in the administrator dashboard. CSV export includes each award, nominee, vote total, and percentage.
-- The final winner or tie is determined independently for each award only after voting closes. Live detailed results remain administrator-only.
+- Results refresh every 10 seconds in the administrator dashboard. CSV export includes main and tie-break vote totals, percentages, and any final winner.
+- Each award is finalized independently after voting closes and any required tie-break is resolved. Live detailed results remain administrator-only.
 
 For production, serve the app only over HTTPS, use a least-privilege Google service identity, keep application secrets out of source control, and back up the Firestore database.
