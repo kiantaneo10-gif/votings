@@ -60,6 +60,9 @@ function googleAuthErrorMessage(error) {
   if (error.code === 'auth/unauthorized-domain') {
     return 'This site domain is not authorized for Firebase Authentication.';
   }
+  if (error.code === 'auth/popup-blocked') {
+    return 'Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.';
+  }
   return error.message || 'Google sign-in could not be completed.';
 }
 
