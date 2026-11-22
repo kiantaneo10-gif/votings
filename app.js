@@ -149,16 +149,16 @@ async function renderPublic(errorMessage = '') {
           <div class="success-icon" aria-hidden="true">✓</div>
           <h2>Your ballot is complete.</h2>
           <p class="muted">Your choices for all six awards have been recorded. Each Google account may submit one ballot.</p>
-          <button id="back-to-ballot" class="button button-secondary" type="button">Back to ballot</button>
+          <button id="voter-signout" class="button button-secondary" type="button">Sign out</button>
         </section>`;
-      const backButton = document.getElementById('back-to-ballot');
-      backButton.addEventListener('click', async () => {
-        backButton.disabled = true;
+      const signOutButton = document.getElementById('voter-signout');
+      signOutButton.addEventListener('click', async () => {
+        signOutButton.disabled = true;
         try {
           await signOutVoter();
           await renderPublic();
         } catch (error) {
-          backButton.disabled = false;
+          signOutButton.disabled = false;
           showToast(error.message);
         }
       });
