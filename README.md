@@ -36,7 +36,7 @@ The supplied Firebase web configuration identifies project `votings-a4db3`. The 
    npm run initialize-db
    ```
 
-   Initialization is safe to rerun: existing election configuration, award titles, and candidate names are preserved. A new project is seeded with six editable award titles, three nominee names, and a closed election.
+   Initialization is safe to rerun: existing election configuration, award titles, and nominee names are preserved. A new project is seeded with six editable award titles and three initial nominees for each award. On upgrade, the server copies existing shared nominees to each award while preserving current vote totals.
 
 4. Create or update the administrator account (password must be at least 12 characters):
 
@@ -57,8 +57,8 @@ The supplied Firebase web configuration identifies project `votings-a4db3`. The 
 ## Firestore data
 
 - `electionConfig/main`: schedule, open/closed state, and submitted ballot count.
-- `awards`: six award titles, ordering, and per-candidate aggregate results.
-- `candidates`: the three nominee names shared across all six awards.
+- `awards`: six award titles, ordering, award-specific nominee names, and per-nominee aggregate results.
+- `candidates`: legacy global nominee records retained for compatibility; active ballots use the nominee lists stored on each award.
 - `admins`: bcrypt password hashes keyed by normalized username.
 - `voters`: normalized full-name voter identifiers used to prevent duplicate ballots; these are removed by an election reset.
 - `votes`: voter names and six-award selections with random document IDs.
@@ -69,9 +69,9 @@ The server validates each ballot and full name and writes the voter identifier, 
 ## Voting and administration
 
 - Administrators sign in from the public page's **Administrator sign in** link.
-- Rename the six default awards and replace the three nominee names before starting. Award and candidate management become locked after voting starts; reset the election to edit them again.
+- Rename each award and enter three nominees for it in **Awards** before starting. Each award has an independent nominee list, so the same person can be nominated in multiple awards. Award and nominee management become locked after voting starts; reset the election to edit them again.
 - Optionally schedule a start date while the election is closed. Choose a 5-, 10-, 15-, or 20-minute voting window each time voting starts or reopens; the server automatically closes voting at the deadline and rejects any later submissions.
-- Exactly six awards and three candidates are required to start voting. All three nominees appear under each award.
+- Exactly six awards with three nominees per award are required to start voting.
 - Voters enter a first and last name, choose one nominee for each award, and submit one complete ballot. The normalized full name may submit only one ballot.
 - The server accepts no more than 55 complete ballots. Because each ballot contains one choice per award, this caps each award at 55 votes; the server closes voting as soon as the limit is reached.
 - If an award is tied after voting closes, the administrator can start a timed runoff for the tied awards only. Voters choose among the nominees tied for each award; the 55-vote cap applies to each tied award, and each full name may vote once in the runoff, including voters who participated in the main election. A unique runoff leader becomes the winner. If a runoff remains tied or gets no votes, the administrator selects one of the tied nominees.

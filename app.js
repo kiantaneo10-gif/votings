@@ -277,7 +277,6 @@ function adminShell(view, content) {
   const links = [
     ['dashboard', 'Overview'],
     ['awards', 'Awards'],
-    ['candidates', 'Candidates'],
     ['voting', 'Voting management'],
     ['results', 'Voting results'],
     ['winner', 'Winner announcement']
@@ -375,34 +374,26 @@ async function renderAdmin(view = 'dashboard') {
     setStatus(summary.status, summary.endAt);
     let content = '';
     if (view === 'awards') {
-      content = `${pageHeading('Award management', 'Rename the six award categories before voting starts.', '<span class="status-pill">6 awards</span>')}
-        <section class="panel">
-          <div class="management-list">${summary.awards.map((award, index) => `
-            <form class="candidate-manage-row award-form" data-id="${award.id}">
-              <span class="candidate-slot">${String(index + 1).padStart(2, '0')}</span>
-              <input aria-label="Award name" maxlength="120" value="${escapeHtml(award.title)}" required ${summary.hasStarted ? 'disabled' : ''}>
-              <button class="button button-secondary button-sm" type="submit" ${summary.hasStarted ? 'disabled' : ''}>Save</button>
-            </form>`).join('')}</div>
-          ${summary.hasStarted ? '<p class="field-help" style="margin-top:16px">Award names are locked after voting starts. Reset the election to edit them again.</p>' : ''}
-        </section>`;
-    } else if (view === 'candidates') {
-      const { candidates } = await api('/api/admin/candidates');
-      content = `${pageHeading('Candidate management', 'Manage the nominees shared by all six awards.', '<span class="status-pill">Names only</span>')}
-        <section class="panel">
-          <h2>Current candidates <span class="muted">(${candidates.length}/3)</span></h2>
-          <div class="management-list">${candidates.map((candidate, index) => `
-            <form class="candidate-manage-row candidate-form" data-id="${candidate.id}">
-              <span class="candidate-slot">${String(index + 1).padStart(2, '0')}</span>
-              <input aria-label="Candidate name" maxlength="120" value="${escapeHtml(candidate.name)}" required ${summary.hasStarted ? 'disabled' : ''}>
-              <div class="inline-actions">
-                <button class="button button-secondary button-sm" type="submit" ${summary.hasStarted ? 'disabled' : ''}>Save</button>
-                <button class="button button-danger button-sm remove-candidate" type="button" data-id="${candidate.id}" ${summary.hasStarted ? 'disabled' : ''}>Remove</button>
+      content = `${pageHeading('Award and nominee management', 'Set three nominees independently for each award. The same person can be nominated in multiple awards.', '<span class="status-pill">6 awards</span>')}
+        <div class="award-results-grid">${summary.awards.map((award, index) => `
+          <section class="panel award-result-panel">
+            <form class="award-form" data-id="${escapeHtml(award.id)}">
+              <div class="field"><label for="award-title-${escapeHtml(award.id)}">Award ${String(index + 1).padStart(2, '0')}</label>
+                <input id="award-title-${escapeHtml(award.id)}" maxlength="120" value="${escapeHtml(award.title)}" required ${summary.hasStarted ? 'disabled' : ''}>
               </div>
-            </form>`).join('') || '<p class="muted">No candidates added.</p>'}</div>
-          ${!summary.hasStarted && candidates.length < 3 ? `<form id="add-candidate-form" class="form-row" style="align-items:end;margin-top:18px"><div class="field" style="margin-bottom:0"><label for="new-candidate-name">Add candidate name</label><input id="new-candidate-name" maxlength="120" minlength="2" required></div><button class="button button-primary" type="submit">Add candidate</button></form>` : ''}
-          ${summary.hasStarted ? '<p class="field-help" style="margin-top:16px">Candidate names are locked after voting has started. Resetting the election unlocks candidate management.</p>' : ''}
-        </section>
-        <section class="vote-note"><span>Exactly three candidates are required. The same three names appear under each of the six awards.</span></section>`;
+              <button class="button button-secondary button-sm" type="submit" ${summary.hasStarted ? 'disabled' : ''}>Save award name</button>
+            </form>
+            <form class="nominees-form" data-id="${escapeHtml(award.id)}">
+              <h2 style="margin-top:20px">Nominees</h2>
+              ${(award.results || []).map((nominee, nomineeIndex) => `
+                <div class="field">
+                  <label for="nominee-${escapeHtml(award.id)}-${nomineeIndex + 1}">Nominee ${nomineeIndex + 1}</label>
+                  <input id="nominee-${escapeHtml(award.id)}-${nomineeIndex + 1}" data-nominee-index="${nomineeIndex}" maxlength="120" minlength="2" value="${escapeHtml(nominee.name)}" required ${summary.hasStarted ? 'disabled' : ''}>
+                </div>`).join('')}
+              <button class="button button-primary button-sm" type="submit" ${summary.hasStarted ? 'disabled' : ''}>Save nominees</button>
+            </form>
+          </section>`).join('')}</div>
+        ${summary.hasStarted ? '<p class="field-help" style="margin-top:16px">Award and nominee names are locked after voting starts. Reset the election to edit them again.</p>' : '<section class="vote-note"><span>Each award has its own nominee list. A nominee can appear in more than one award; changing a name in one award will not affect another award.</span></section>'}`;
     } else if (view === 'voting') {
       const ballotReady = summary.candidateCount === 3 && summary.awardCount === 6;
       const tiedAwards = summary.awards.filter(award => award.winner && award.winner.tie && !award.winner.tieBreakPending);
@@ -437,9 +428,9 @@ async function renderAdmin(view = 'dashboard') {
           <article class="stat-card"><div class="stat-label">STATUS</div><div class="stat-value small">${summary.status === 'open' ? 'Open' : 'Closed'}</div></article>
           <article class="stat-card"><div class="stat-label">AWARDS</div><div class="stat-value">${summary.awardCount} / 6</div></article>
           <article class="stat-card"><div class="stat-label">BALLOTS SUBMITTED</div><div class="stat-value">${summary.totalVotes}</div></article>
-          <article class="stat-card"><div class="stat-label">NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount} / 3</div></article>
+          <article class="stat-card"><div class="stat-label">MIN NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount} / 3</div></article>
         </div>
-        ${!ballotReady ? '<div class="alert" role="alert">The ballot needs exactly six awards and three candidates before voting can open.</div>' : ''}
+        ${!ballotReady ? '<div class="alert" role="alert">The ballot needs exactly six awards with three nominees configured for each award before voting can open.</div>' : ''}
         <section class="panel">
           <h2>Voting start and duration</h2>
           <p class="muted">${summary.tieBreak && summary.tieBreak.status === 'open' ? 'The tie-break runoff is open; voters can select only among nominees tied for each award.' : "Times use your browser's local time zone. Set an optional start time and choose a duration; voting closes automatically when the timer expires."}</p>
@@ -456,7 +447,7 @@ async function renderAdmin(view = 'dashboard') {
         ${tieBreakResolution}
         <section class="panel" style="margin-top:16px">
           <h2>Reset election</h2>
-          <p class="muted">Permanently remove all ballots and clear the vote totals. Voting will be closed, and award and candidate names will be unlocked.</p>
+          <p class="muted">Permanently remove all ballots and clear the vote totals. Voting will be closed, and award and nominee names will be unlocked.</p>
           <button id="reset-election" class="button button-danger">Reset all votes</button>
         </section>`;
     } else if (view === 'results') {
@@ -464,7 +455,7 @@ async function renderAdmin(view = 'dashboard') {
         <div class="stats-grid">
           <article class="stat-card"><div class="stat-label">BALLOTS SUBMITTED</div><div class="stat-value">${summary.totalVotes}</div></article>
           <article class="stat-card"><div class="stat-label">AWARDS</div><div class="stat-value">${summary.awardCount}</div></article>
-          <article class="stat-card"><div class="stat-label">NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount}</div></article>
+          <article class="stat-card"><div class="stat-label">MIN NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount}</div></article>
           <article class="stat-card"><div class="stat-label">VOTING STATUS</div><div class="stat-value small">${summary.status === 'open' ? 'Open' : 'Closed'}</div></article>
         </div>
         ${awardResultPanels(summary.awards)}
@@ -480,7 +471,7 @@ async function renderAdmin(view = 'dashboard') {
         <div class="stats-grid">
           <article class="stat-card"><div class="stat-label">BALLOTS SUBMITTED</div><div class="stat-value">${summary.totalVotes}</div></article>
           <article class="stat-card"><div class="stat-label">AWARDS</div><div class="stat-value">${summary.awardCount} / 6</div></article>
-          <article class="stat-card"><div class="stat-label">NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount} / 3</div></article>
+          <article class="stat-card"><div class="stat-label">MIN NOMINEES PER AWARD</div><div class="stat-value">${summary.candidateCount} / 3</div></article>
           <article class="stat-card"><div class="stat-label">VOTING STATUS</div><div class="stat-value small">${summary.status === 'open' ? 'Open' : 'Closed'}</div></article>
         </div>
         <h2 class="section-title">${summary.status === 'open' ? 'Current leaders' : 'Award winners'}</h2>
@@ -517,30 +508,18 @@ function bindAdminActions(view) {
       renderAdmin('awards');
     } catch (error) { showToast(error.message); }
   }));
-  main.querySelectorAll('.candidate-form').forEach(form => form.addEventListener('submit', async event => {
+  main.querySelectorAll('.nominees-form').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();
-    const name = form.querySelector('input').value;
+    const names = [...form.querySelectorAll('input[data-nominee-index]')].map(input => input.value);
     try {
-      await api(`/api/admin/candidates/${form.dataset.id}`, { method: 'PUT', body: { name } });
-      showToast('Candidate name saved.');
-      renderAdmin('candidates');
+      await api(`/api/admin/awards/${form.dataset.id}/nominees`, {
+        method: 'PUT',
+        body: { names }
+      });
+      showToast('Nominees saved for this award.');
+      renderAdmin('awards');
     } catch (error) { showToast(error.message); }
   }));
-  main.querySelectorAll('.remove-candidate').forEach(button => button.addEventListener('click', async () => {
-    if (!window.confirm('Remove this candidate? You can add a replacement before starting voting.')) return;
-    try {
-      await api(`/api/admin/candidates/${button.dataset.id}`, { method: 'DELETE' });
-      renderAdmin('candidates');
-    } catch (error) { showToast(error.message); }
-  }));
-  const addForm = document.getElementById('add-candidate-form');
-  if (addForm) addForm.addEventListener('submit', async event => {
-    event.preventDefault();
-    try {
-      await api('/api/admin/candidates', { method: 'POST', body: { name: document.getElementById('new-candidate-name').value } });
-      renderAdmin('candidates');
-    } catch (error) { showToast(error.message); }
-  });
   const scheduleForm = document.getElementById('schedule-form');
   if (scheduleForm) scheduleForm.addEventListener('submit', async event => {
     event.preventDefault();
@@ -685,7 +664,7 @@ async function route() {
       return;
     }
     adminUsername = session.username;
-    const allowedViews = ['dashboard', 'awards', 'candidates', 'voting', 'results', 'winner'];
+    const allowedViews = ['dashboard', 'awards', 'voting', 'results', 'winner'];
     const view = allowedViews.includes(segments[1]) ? segments[1] : 'dashboard';
     renderAdmin(view);
     return;

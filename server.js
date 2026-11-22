@@ -105,17 +105,20 @@ function copyTieBreak(tieBreak) {
   };
 }
 
-function effectiveTieBreak(config, candidates) {
+function effectiveTieBreak(config, awards) {
   if (!config.tieBreak) return null;
   const tieBreak = copyTieBreak(config.tieBreak);
   if (tieBreak.status === 'open' && !tieBreakOpen(config)) tieBreak.status = 'needs_admin';
-  Object.values(tieBreak.awards || {}).forEach(award => {
-    if (award.winnerCandidateId) return;
-    const result = toResults(candidates.filter(candidate => award.candidateIds.includes(candidate.id)), award.results);
-    if (result.leaders.length === 1) award.winnerCandidateId = result.leaders[0].id;
-    else award.pendingCandidateIds = result.leaders.length
+  Object.entries(tieBreak.awards || {}).forEach(([awardId, tieAward]) => {
+    if (tieAward.winnerCandidateId) return;
+    const award = awards.find(item => item.id === awardId);
+    if (!award) return;
+    const nominees = (award.nominees || []).filter(candidate => tieAward.candidateIds.includes(candidate.id));
+    const result = toResults(nominees, tieAward.results);
+    if (result.leaders.length === 1) tieAward.winnerCandidateId = result.leaders[0].id;
+    else tieAward.pendingCandidateIds = result.leaders.length
       ? result.leaders.map(candidate => candidate.id)
-      : [...award.candidateIds];
+      : [...tieAward.candidateIds];
   });
   if (tieBreak.status !== 'open') {
     tieBreak.status = Object.values(tieBreak.awards || {}).every(award => award.winnerCandidateId)
@@ -198,16 +201,42 @@ function scheduleAutoClose(deadline) {
   if (typeof autoCloseTimer.unref === 'function') autoCloseTimer.unref();
 }
 
-async function getCandidates(transaction, ordered = true) {
-  const query = ordered ? candidatesRef.orderBy('sortOrder') : candidatesRef;
-  const snapshot = transaction ? await transaction.get(query) : await query.get();
-  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-}
-
 async function getAwards(transaction) {
   const query = awardsRef.orderBy('sortOrder');
   const snapshot = transaction ? await transaction.get(query) : await query.get();
   return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+}
+
+async function migrateLegacyAwardNominees() {
+  await db.runTransaction(async transaction => {
+    const [candidateSnapshot, awardSnapshot] = await Promise.all([
+      transaction.get(candidatesRef.orderBy('sortOrder')),
+      transaction.get(awardsRef.orderBy('sortOrder'))
+    ]);
+    if (awardSnapshot.empty || awardSnapshot.docs.every(award =>
+      Array.isArray(award.get('nominees')) && award.get('nominees').length === 3)) {
+      return;
+    }
+    if (candidateSnapshot.size !== 3) {
+      throw new Error('Each award must be initialized with three nominees. Run npm run initialize-db.');
+    }
+    const nominees = candidateSnapshot.docs.map(candidate => ({
+      id: candidate.id,
+      name: candidate.get('name')
+    }));
+    awardSnapshot.docs.forEach(award => {
+      if (Array.isArray(award.get('nominees')) && award.get('nominees').length === 3) return;
+      const results = { ...(award.get('results') || {}) };
+      nominees.forEach(nominee => {
+        if (typeof results[nominee.id] !== 'number') results[nominee.id] = 0;
+      });
+      transaction.update(award.ref, {
+        nominees,
+        results,
+        updatedAt: FieldValue.serverTimestamp()
+      });
+    });
+  });
 }
 
 function createCsrfToken(req) {
@@ -244,11 +273,12 @@ function toResults(candidates, voteCounts = null) {
   return { totalVotes, results, highest, leaders };
 }
 
-function summarizeAward(award, candidates, status, tieBreak = null) {
-  const result = toResults(candidates, award.results || {});
+function summarizeAward(award, status, tieBreak = null) {
+  const nominees = award.nominees || [];
+  const result = toResults(nominees, award.results || {});
   const runoff = tieBreak && tieBreak.awards && tieBreak.awards[award.id];
   const runoffResult = runoff
-    ? toResults(candidates.filter(candidate => runoff.candidateIds.includes(candidate.id)), runoff.results)
+    ? toResults(nominees.filter(candidate => runoff.candidateIds.includes(candidate.id)), runoff.results)
     : null;
   let winner = status === 'closed' && result.totalVotes > 0
     ? {
@@ -261,7 +291,7 @@ function summarizeAward(award, candidates, status, tieBreak = null) {
     : null;
   if (runoff && status === 'closed') {
     if (runoff.winnerCandidateId) {
-      const selected = candidates.find(candidate => candidate.id === runoff.winnerCandidateId);
+      const selected = nominees.find(candidate => candidate.id === runoff.winnerCandidateId);
       winner = selected ? {
         tie: false,
         candidates: [selected.name],
@@ -273,7 +303,7 @@ function summarizeAward(award, candidates, status, tieBreak = null) {
         tieBreak: true
       } : winner;
     } else {
-      const runoffCandidates = candidates.filter(candidate => runoff.candidateIds.includes(candidate.id));
+      const runoffCandidates = nominees.filter(candidate => runoff.candidateIds.includes(candidate.id));
       winner = {
         tie: true,
         candidates: runoffResult.leaders.length
@@ -328,8 +358,8 @@ app.get('/api/csrf', (req, res) => {
 });
 
 app.get('/api/public', asyncRoute(async (req, res) => {
-  const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const tieBreak = effectiveTieBreak(config, candidates);
+  const [config, awards] = await Promise.all([getConfig(), getAwards()]);
+  const tieBreak = effectiveTieBreak(config, awards);
   const tieBreakActive = tieBreak && tieBreak.status === 'open';
   const status = tieBreakActive ? 'open' : publicStatus(config, awards);
   const limitReached = !tieBreakActive && voteLimitReached(config, awards);
@@ -346,11 +376,11 @@ app.get('/api/public', asyncRoute(async (req, res) => {
     maxVotesPerAward,
     limitReached,
     awards: publicAwards.map(award => {
-      const runoff = tieBreakActive && tieBreak.awards[award.id];
-      const eligibleCandidates = runoff
-        ? candidates.filter(candidate => runoff.candidateIds.includes(candidate.id))
-        : candidates;
-      const summary = summarizeAward(award, candidates, status, tieBreak);
+      const eligibleCandidates = tieBreakActive
+        ? (award.nominees || []).filter(candidate =>
+            tieBreak.awards[award.id].candidateIds.includes(candidate.id))
+        : award.nominees || [];
+      const summary = summarizeAward(award, status, tieBreak);
       return {
         id: summary.id,
         title: summary.title,
@@ -402,11 +432,11 @@ app.post('/api/logout', requireAdmin, requireCsrf, (req, res, next) => {
 app.use('/api/admin', requireAdmin);
 
 app.get('/api/admin/summary', asyncRoute(async (req, res) => {
-  const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const tieBreak = effectiveTieBreak(config, candidates);
+  const [config, awards] = await Promise.all([getConfig(), getAwards()]);
+  const tieBreak = effectiveTieBreak(config, awards);
   const tieBreakActive = tieBreak && tieBreak.status === 'open';
   const status = tieBreakActive ? 'open' : publicStatus(config, awards);
-  const awardSummaries = awards.map(award => summarizeAward(award, candidates, status, tieBreak));
+  const awardSummaries = awards.map(award => summarizeAward(award, status, tieBreak));
   const unresolvedAwards = tieBreak && tieBreak.status === 'needs_admin'
     ? Object.entries(tieBreak.awards)
       .filter(([, tieAward]) => !tieAward.winnerCandidateId)
@@ -414,7 +444,8 @@ app.get('/api/admin/summary', asyncRoute(async (req, res) => {
         id,
         title: awards.find(award => award.id === id)?.title || id,
         candidates: (tieAward.pendingCandidateIds || tieAward.candidateIds).map(candidateId => {
-          const candidate = candidates.find(item => item.id === candidateId);
+          const candidate = (awards.find(item => item.id === id)?.nominees || [])
+            .find(item => item.id === candidateId);
           return candidate ? { id: candidate.id, name: candidate.name } : null;
         }).filter(Boolean)
       }))
@@ -422,7 +453,9 @@ app.get('/api/admin/summary', asyncRoute(async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
     totalVotes: Number(config.totalBallots || 0),
-    candidateCount: candidates.length,
+    candidateCount: awards.length
+      ? Math.min(...awards.map(award => (award.nominees || []).length))
+      : 0,
     awardCount: awards.length,
     status,
     hasStarted: Boolean(config.hasStarted),
@@ -458,78 +491,43 @@ app.put('/api/admin/awards/:id', requireCsrf, asyncRoute(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/admin/candidates', asyncRoute(async (req, res) => {
-  const candidates = await getCandidates();
-  res.json({ candidates: candidates.map(({ id, name }) => ({ id, name })) });
-}));
-
-app.put('/api/admin/candidates/:id', requireCsrf, asyncRoute(async (req, res) => {
+app.put('/api/admin/awards/:id/nominees', requireCsrf, asyncRoute(async (req, res) => {
   const id = req.params.id;
-  const name = typeof req.body.name === 'string' ? req.body.name.trim().replace(/\s+/g, ' ') : '';
-  if (!validDocumentId(id) || name.length < 2 || name.length > 120) {
-    return res.status(400).json({ error: 'Enter a candidate name between 2 and 120 characters.' });
+  const names = Array.isArray(req.body.names)
+    ? req.body.names.map(name =>
+        typeof name === 'string' ? name.normalize('NFKC').trim().replace(/\s+/g, ' ') : '')
+    : [];
+  if (!validDocumentId(id) || names.length !== 3 ||
+      names.some(name => name.length < 2 || name.length > 120 || /[\u0000-\u001f\u007f]/.test(name)) ||
+      new Set(names.map(name => name.toLocaleLowerCase('en-US'))).size !== names.length) {
+    return res.status(400).json({ error: 'Enter three different nominee names between 2 and 120 characters.' });
   }
-  const candidateRef = candidatesRef.doc(id);
+  const awardRef = awardsRef.doc(id);
   await db.runTransaction(async transaction => {
-    const [config, candidate] = await Promise.all([
+    const [configSnapshot, awardSnapshot] = await Promise.all([
       transaction.get(configRef),
-      transaction.get(candidateRef)
+      transaction.get(awardRef)
     ]);
-    if (!config.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
-    if (config.data().hasStarted) throw new HttpError(409, 'Candidate names are locked after voting has started.');
-    if (!candidate.exists) throw new HttpError(404, 'Candidate not found.');
-    transaction.update(candidateRef, { name, updatedAt: FieldValue.serverTimestamp() });
-  });
-  res.json({ ok: true });
-}));
-
-app.post('/api/admin/candidates', requireCsrf, asyncRoute(async (req, res) => {
-  const name = typeof req.body.name === 'string' ? req.body.name.trim().replace(/\s+/g, ' ') : '';
-  if (name.length < 2 || name.length > 120) {
-    return res.status(400).json({ error: 'Enter a name between 2 and 120 characters.' });
-  }
-  const candidateRef = candidatesRef.doc(crypto.randomBytes(12).toString('hex'));
-  await db.runTransaction(async transaction => {
-    const [config, candidates, awards] = await Promise.all([
-      transaction.get(configRef),
-      transaction.get(candidatesRef.orderBy('sortOrder')),
-      transaction.get(awardsRef.orderBy('sortOrder'))
-    ]);
-    if (!config.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
-    if (config.data().hasStarted) throw new HttpError(409, 'Candidates are locked after voting has started.');
-    if (candidates.size >= 3) throw new HttpError(409, 'There are already three candidates. Remove one before adding another.');
-    const nextOrder = candidates.docs.reduce((highest, doc) => Math.max(highest, Number(doc.get('sortOrder') || 0)), 0) + 1;
-    transaction.create(candidateRef, {
-      name,
-      votes: 0,
-      sortOrder: nextOrder,
-      createdAt: FieldValue.serverTimestamp()
+    if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
+    if (configSnapshot.get('hasStarted')) {
+      throw new HttpError(409, 'Nominee names are locked after voting has started. Reset the election to edit them.');
+    }
+    if (!awardSnapshot.exists) throw new HttpError(404, 'Award not found.');
+    const award = awardSnapshot.data();
+    const previousNominees = Array.isArray(award.nominees) ? award.nominees : [];
+    const nominees = names.map((name, index) => ({
+      id: previousNominees[index] && previousNominees[index].id ||
+        crypto.randomBytes(12).toString('hex'),
+      name
+    }));
+    const results = { ...(award.results || {}) };
+    nominees.forEach(nominee => {
+      if (typeof results[nominee.id] !== 'number') results[nominee.id] = 0;
     });
-    awards.docs.forEach(award => {
-      transaction.update(award.ref, { [`results.${candidateRef.id}`]: 0 });
-    });
-  });
-  res.status(201).json({ ok: true });
-}));
-
-app.delete('/api/admin/candidates/:id', requireCsrf, asyncRoute(async (req, res) => {
-  const id = req.params.id;
-  if (!validDocumentId(id)) return res.status(400).json({ error: 'Invalid candidate.' });
-  const candidateRef = candidatesRef.doc(id);
-  await db.runTransaction(async transaction => {
-    const [config, candidate, candidates, awards] = await Promise.all([
-      transaction.get(configRef),
-      transaction.get(candidateRef),
-      transaction.get(candidatesRef.orderBy('sortOrder')),
-      transaction.get(awardsRef.orderBy('sortOrder'))
-    ]);
-    if (!config.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
-    if (config.data().hasStarted) throw new HttpError(409, 'Candidates are locked after voting has started.');
-    if (!candidate.exists) throw new HttpError(404, 'Candidate not found.');
-    if (candidates.size <= 1) throw new HttpError(409, 'At least one candidate must remain.');
-    transaction.delete(candidateRef);
-    awards.docs.forEach(award => {
-      transaction.update(award.ref, { [`results.${id}`]: FieldValue.delete() });
+    transaction.update(awardRef, {
+      nominees,
+      results,
+      updatedAt: FieldValue.serverTimestamp()
     });
   });
   res.json({ ok: true });
@@ -566,9 +564,8 @@ app.post('/api/admin/tiebreak/start', requireCsrf, asyncRoute(async (req, res) =
   const roundId = crypto.randomBytes(12).toString('hex');
   let endAt = null;
   await db.runTransaction(async transaction => {
-    const [configSnapshot, candidatesSnapshot, awardsSnapshot] = await Promise.all([
+    const [configSnapshot, awardsSnapshot] = await Promise.all([
       transaction.get(configRef),
-      transaction.get(candidatesRef.orderBy('sortOrder')),
       transaction.get(awardsRef.orderBy('sortOrder'))
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
@@ -579,10 +576,9 @@ app.post('/api/admin/tiebreak/start', requireCsrf, asyncRoute(async (req, res) =
     }
     if (config.tieBreak) throw new HttpError(409, 'A tie-break runoff has already been started for this election.');
 
-    const candidates = candidatesSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
     const tiedAwards = {};
     awards.forEach(award => {
-      const result = toResults(candidates, award.results || {});
+      const result = toResults(award.nominees || [], award.results || {});
       if (result.leaders.length > 1) {
         tiedAwards[award.id] = {
           candidateIds: result.leaders.map(candidate => candidate.id),
@@ -618,14 +614,14 @@ app.post('/api/admin/tiebreak/resolve', requireCsrf, asyncRoute(async (req, res)
     return res.status(400).json({ error: 'Choose a winner for each tied award.' });
   }
   await db.runTransaction(async transaction => {
-    const [configSnapshot, candidatesSnapshot] = await Promise.all([
+    const [configSnapshot, awardsSnapshot] = await Promise.all([
       transaction.get(configRef),
-      transaction.get(candidatesRef)
+      transaction.get(awardsRef.orderBy('sortOrder'))
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
-    const candidates = candidatesSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
+    const awards = awardsSnapshot.docs.map(document => ({ id: document.id, ...document.data() }));
     const config = configSnapshot.data();
-    const tieBreak = effectiveTieBreak(config, candidates);
+    const tieBreak = effectiveTieBreak(config, awards);
     if (!tieBreak || tieBreak.status === 'open') {
       throw new HttpError(409, 'Finish the tie-break runoff before selecting winners.');
     }
@@ -640,14 +636,16 @@ app.post('/api/admin/tiebreak/resolve', requireCsrf, asyncRoute(async (req, res)
       throw new HttpError(400, 'Choose exactly one winner for every award still tied after the runoff.');
     }
     unresolvedIds.forEach(id => {
-      const award = tieBreak.awards[id];
+      const tieAward = tieBreak.awards[id];
       const candidateId = winners[id];
+      const award = awards.find(item => item.id === id);
       if (typeof candidateId !== 'string' ||
-          !(award.pendingCandidateIds || award.candidateIds).includes(candidateId) ||
-          !candidates.some(candidate => candidate.id === candidateId)) {
+          !award ||
+          !(tieAward.pendingCandidateIds || tieAward.candidateIds).includes(candidateId) ||
+          !(award.nominees || []).some(candidate => candidate.id === candidateId)) {
         throw new HttpError(400, 'Choose a valid tied nominee for each award.');
       }
-      award.winnerCandidateId = candidateId;
+      tieAward.winnerCandidateId = candidateId;
     });
     tieBreak.status = 'resolved';
     tieBreak.resolvedBy = req.session.adminUsername || req.session.adminId;
@@ -674,9 +672,8 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
   }
   let endAt = null;
   await db.runTransaction(async transaction => {
-    const [configSnapshot, candidates, awards] = await Promise.all([
+    const [configSnapshot, awards] = await Promise.all([
       transaction.get(configRef),
-      transaction.get(candidatesRef.orderBy('sortOrder')),
       transaction.get(awardsRef.orderBy('sortOrder'))
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
@@ -687,8 +684,8 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
     if (action !== 'close' && voteLimitReached(config, awards.docs.map(award => award.data()))) {
       throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
-    if (action !== 'close' && candidates.size !== 3) {
-      throw new HttpError(409, 'Exactly three candidates are required before voting can open.');
+    if (action !== 'close' && awards.docs.some(award => !Array.isArray(award.get('nominees')) || award.get('nominees').length !== 3)) {
+      throw new HttpError(409, 'Each award must have exactly three nominees before voting can open.');
     }
     if (action !== 'close' && awards.size !== requiredAwardCount) {
       throw new HttpError(409, `Exactly ${requiredAwardCount} awards are required before voting can open.`);
@@ -697,11 +694,10 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
       throw new HttpError(409, 'Voting cannot open before its configured start date.');
     }
     if (action === 'close' && config.tieBreak) {
-      const currentCandidates = candidates.docs.map(document => ({ id: document.id, ...document.data() }));
       const tieBreak = effectiveTieBreak({
         ...config,
         tieBreak: { ...config.tieBreak, status: 'needs_admin' }
-      }, currentCandidates);
+      }, awards.docs.map(document => ({ id: document.id, ...document.data() })));
       transaction.update(configRef, {
         tieBreak,
         isOpen: false,
@@ -729,14 +725,13 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
 
 app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
   await db.runTransaction(async transaction => {
-    const [configSnapshot, candidates, awards] = await Promise.all([
+    const [configSnapshot, awards] = await Promise.all([
       transaction.get(configRef),
-      transaction.get(candidatesRef.orderBy('sortOrder')),
       transaction.get(awardsRef.orderBy('sortOrder'))
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     awards.docs.forEach(award => {
-      const results = Object.fromEntries(candidates.docs.map(candidate => [candidate.id, 0]));
+      const results = Object.fromEntries((award.get('nominees') || []).map(candidate => [candidate.id, 0]));
       transaction.update(award.ref, { results });
     });
     transaction.update(configRef, {
@@ -757,8 +752,8 @@ app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/admin/export.csv', asyncRoute(async (req, res) => {
-  const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const tieBreak = effectiveTieBreak(config, candidates);
+  const [config, awards] = await Promise.all([getConfig(), getAwards()]);
+  const tieBreak = effectiveTieBreak(config, awards);
   const status = tieBreak && tieBreak.status === 'open' ? 'open' : publicStatus(config, awards);
   const quote = value => {
     const safeValue = typeof value === 'string' && /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
@@ -768,11 +763,12 @@ app.get('/api/admin/export.csv', asyncRoute(async (req, res) => {
     ['Round', 'Award', 'Candidate name', 'Votes', 'Percentage', 'Final winner'].map(quote).join(',')
   ];
   awards.forEach(award => {
-    const summary = summarizeAward(award, candidates, status, tieBreak);
+    const nominees = award.nominees || [];
+    const summary = summarizeAward(award, status, tieBreak);
     const finalWinner = summary.winner && !summary.winner.tie && !summary.winner.tieBreakPending
       ? summary.winner.candidates[0]
       : '';
-    const result = toResults(candidates, award.results || {});
+    const result = toResults(nominees, award.results || {});
     result.results.forEach(candidate => {
       lines.push([
         'Main',
@@ -786,7 +782,7 @@ app.get('/api/admin/export.csv', asyncRoute(async (req, res) => {
     const runoff = tieBreak && tieBreak.awards[award.id];
     if (runoff) {
       const runoffResult = toResults(
-        candidates.filter(candidate => runoff.candidateIds.includes(candidate.id)),
+        nominees.filter(candidate => runoff.candidateIds.includes(candidate.id)),
         runoff.results
       );
       runoffResult.results.forEach(candidate => {
@@ -826,12 +822,8 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
     const configSnapshot = await transaction.get(configRef);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
-    const [awardSnapshot, candidateSnapshot] = await Promise.all([
-      transaction.get(awardsRef.orderBy('sortOrder')),
-      transaction.get(candidatesRef.orderBy('sortOrder'))
-    ]);
-    const candidateIds = new Set(candidateSnapshot.docs.map(candidate => candidate.id));
-    const candidateData = candidateSnapshot.docs.map(candidate => ({ id: candidate.id, ...candidate.data() }));
+    const awardSnapshot = await transaction.get(awardsRef.orderBy('sortOrder'));
+    const awardData = awardSnapshot.docs.map(award => ({ id: award.id, ...award.data() }));
     const inTieBreak = tieBreakOpen(config);
     if (inTieBreak) {
       const runoffAwards = config.tieBreak.awards || {};
@@ -843,8 +835,10 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       const ballot = {};
       for (const awardId of runoffAwardIds) {
         const candidateId = selections[awardId];
+        const award = awardData.find(item => item.id === awardId);
         if (typeof candidateId !== 'string' || !validDocumentId(candidateId) ||
-            !runoffAwards[awardId].candidateIds.includes(candidateId) || !candidateIds.has(candidateId)) {
+            !runoffAwards[awardId].candidateIds.includes(candidateId) ||
+            !(award && award.nominees || []).some(candidate => candidate.id === candidateId)) {
           throw new HttpError(400, 'Choose a valid tied nominee for every award.');
         }
         ballot[awardId] = candidateId;
@@ -867,7 +861,7 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       );
       if (limitReached) {
         nextTieBreak.status = 'needs_admin';
-        nextTieBreak = effectiveTieBreak({ tieBreak: nextTieBreak }, candidateData);
+        nextTieBreak = effectiveTieBreak({ tieBreak: nextTieBreak }, awardData);
       }
 
       const voteRef = db.collection('votes').doc(crypto.randomBytes(16).toString('hex'));
@@ -902,10 +896,10 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
     if (Number(config.totalBallots || 0) >= maxVotesPerAward) {
       throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
-    if (awardSnapshot.size !== requiredAwardCount || candidateSnapshot.size !== 3) {
+    if (awardSnapshot.size !== requiredAwardCount ||
+        awardData.some(award => !Array.isArray(award.nominees) || award.nominees.length !== 3)) {
       throw new HttpError(409, 'The six-award ballot is not ready for voting.');
     }
-    const awardData = awardSnapshot.docs.map(award => award.data());
     if (voteLimitReached(config, awardData)) {
       throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
@@ -921,7 +915,9 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
     const ballot = {};
     for (const award of awardSnapshot.docs) {
       const candidateId = selections[award.id];
-      if (typeof candidateId !== 'string' || !validDocumentId(candidateId) || !candidateIds.has(candidateId)) {
+      const nominees = award.get('nominees') || [];
+      if (typeof candidateId !== 'string' || !validDocumentId(candidateId) ||
+          !nominees.some(candidate => candidate.id === candidateId)) {
         throw new HttpError(400, `Choose a valid candidate for ${award.get('title')}.`);
       }
       ballot[award.id] = candidateId;
@@ -981,6 +977,7 @@ app.use((error, req, res, next) => {
 });
 
 async function start() {
+  await migrateLegacyAwardNominees();
   const config = await getConfig();
   if (config.isOpen) scheduleAutoClose(config.endAt);
   app.listen(port, () => console.log(`Award Voting System listening on http://localhost:${port}`));

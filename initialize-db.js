@@ -35,8 +35,6 @@ async function main() {
         hasStarted: false,
         startAt: Timestamp.now(),
         endAt: null,
-        epoch: 1,
-        voterAuthProvider: 'phone',
         totalBallots: 0,
         updatedAt: FieldValue.serverTimestamp()
       });
@@ -62,6 +60,9 @@ async function main() {
     const candidateIds = candidateSnapshot.empty
       ? seedCandidates.map((_, index) => `candidate-${index + 1}`)
       : candidateSnapshot.docs.map(candidate => candidate.id);
+    const candidateNames = new Map(candidateSnapshot.empty
+      ? seedCandidates.map((name, index) => [`candidate-${index + 1}`, name])
+      : candidateSnapshot.docs.map(candidate => [candidate.id, candidate.get('name')]));
     const existingAwards = new Map(awardSnapshot.docs.map(award => [award.id, award]));
     if ([...existingAwards.keys()].some(id => !seedAwards.some((_, index) => id === `award-${index + 1}`))) {
       throw new Error('Unexpected award document IDs found. Resolve them before initializing the six-award ballot.');
@@ -73,6 +74,10 @@ async function main() {
         transaction.create(awardsRef.doc(id), {
           title,
           sortOrder: index + 1,
+          nominees: candidateIds.map(candidateId => ({
+            id: candidateId,
+            name: candidateNames.get(candidateId)
+          })),
           results: Object.fromEntries(candidateIds.map(candidateId => [candidateId, 0])),
           createdAt: FieldValue.serverTimestamp()
         });
@@ -84,9 +89,17 @@ async function main() {
       candidateIds.forEach(candidateId => {
         if (typeof results[candidateId] !== 'number') results[candidateId] = 0;
       });
-      if (!awardData.sortOrder || JSON.stringify(results) !== JSON.stringify(awardData.results || {})) {
+      const nominees = Array.isArray(awardData.nominees) && awardData.nominees.length
+        ? awardData.nominees
+        : candidateIds.map(candidateId => ({
+            id: candidateId,
+            name: candidateNames.get(candidateId)
+          }));
+      if (!awardData.sortOrder || JSON.stringify(results) !== JSON.stringify(awardData.results || {}) ||
+          JSON.stringify(nominees) !== JSON.stringify(awardData.nominees || [])) {
         transaction.update(existing.ref, {
           sortOrder: awardData.sortOrder || index + 1,
+          nominees,
           results
         });
       }
