@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const FirestoreSessionStore = require('./firestore-session-store');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const { rateLimit } = require('express-rate-limit');
@@ -39,6 +40,11 @@ class HttpError extends Error {
 }
 
 app.disable('x-powered-by');
+app.use(createProxyMiddleware({
+  target: `https://${process.env.FIREBASE_PROJECT_ID || 'votings-a4db3'}.firebaseapp.com`,
+  changeOrigin: true,
+  pathFilter: pathname => /^\/__\/auth(?:\/|$)/.test(pathname)
+}));
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {

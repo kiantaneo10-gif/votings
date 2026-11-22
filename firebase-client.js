@@ -7,12 +7,13 @@ import {
   getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
+  signInWithRedirect,
   signOut
 } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB7J2mjCm8zD_gxEY66Q4PxxdMMKTWSD9k",
-  authDomain: "votings-a4db3.firebaseapp.com",
+  authDomain: "votings-1.onrender.com",
   projectId: "votings-a4db3",
   storageBucket: "votings-a4db3.firebasestorage.app",
   messagingSenderId: "524100923505",
@@ -70,6 +71,12 @@ export async function signInWithGoogle() {
     return voter;
   }
 
+  const mobileBrowser = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+    || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(navigator.userAgent));
+  if (mobileBrowser) {
+    await signInWithRedirect(auth, provider);
+    return null;
+  }
   const result = await signInWithPopup(auth, provider);
   voter = result.user;
   return result.user;
