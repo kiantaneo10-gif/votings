@@ -1,19 +1,18 @@
 # Award Voting System
 
-A responsive six-award ballot and administrator dashboard backed by Cloud Firestore. Voters submit one nominee for each award in a single ballot. The Node server uses Firebase Admin SDK with Application Default Credentials (ADC); browser code does not access Firestore directly. Voter identifiers are normalized and HMAC-hashed before storage, and voter choices are kept separate from voter records.
+A responsive six-award ballot and administrator dashboard backed by Cloud Firestore. Voters enter their full name and submit one nominee for each award in a single ballot. The server stores the voter name with each ballot and enforces a 55-ballot maximum.
 
 ## Requirements
 
 - Node.js 22 or newer
 - A Firebase project with Cloud Firestore enabled
-- Firebase Authentication with Phone sign-in enabled
 - Application Default Credentials authorized for that project
 
 The supplied Firebase web configuration identifies project `votings-a4db3`. The server uses the project ID and ADC; the web API key is not a server credential.
 
 ## Setup on Windows
 
-1. Copy the environment template and set distinct random values for `SESSION_SECRET` and `VOTER_HASH_SECRET`. Keep `.env` private:
+1. Copy the environment template and set a random value for `SESSION_SECRET`. Keep `.env` private:
 
    ```powershell
    Copy-Item .env.example .env
@@ -21,7 +20,7 @@ The supplied Firebase web configuration identifies project `votings-a4db3`. The 
 
    Confirm `FIREBASE_PROJECT_ID=votings-a4db3`. Ensure ADC is available to the Node process (for example, through `GOOGLE_APPLICATION_CREDENTIALS` or an existing Google Cloud runtime identity). The identity needs permission to read and write Firestore.
 
-2. In Firebase Console, open **Authentication → Get started → Sign-in method → Phone**, enable phone sign-in, and configure the SMS region policy and billing/quota settings. Under **Authentication → Settings → Authorized domains**, ensure your production domain is listed. Phone sign-in cannot use `localhost`; use Firebase's fictional phone numbers for local testing. Create the project's default Cloud Firestore database if it does not exist. Deploy the included deny-all client rules so database access stays on this authenticated server:
+2. Create the project's default Cloud Firestore database if it does not exist. Deploy the included deny-all client rules so database access stays on this authenticated server:
 
    ```powershell
    firebase use votings-a4db3
@@ -57,15 +56,15 @@ The supplied Firebase web configuration identifies project `votings-a4db3`. The 
 
 ## Firestore data
 
-- `electionConfig/main`: schedule, open/closed state, election epoch, and submitted ballot count.
+- `electionConfig/main`: schedule, open/closed state, and submitted ballot count.
 - `awards`: six award titles, ordering, and per-candidate aggregate results.
 - `candidates`: the three nominee names shared across all six awards.
 - `admins`: bcrypt password hashes keyed by normalized username.
-- `voters`: one HMAC-derived document per verified phone number and election; no raw phone number or candidate choice.
-- `votes`: anonymous six-award selections with random document IDs.
+- `voters`: normalized full-name voter identifiers used to prevent duplicate ballots; these are removed by an election reset.
+- `votes`: voter names and six-award selections with random document IDs.
 - `sessions`: expiring server-side administrator sessions.
 
-The server validates every vote and writes the voter record, anonymous vote, and candidate count in a Firestore transaction. Reset closes voting, clears aggregate counts, increments the election epoch, and deletes vote and voter documents. Sessions expire after eight hours; configure Firestore TTL on `sessions.expiresAt` to automatically remove expired session documents.
+The server validates each ballot and full name and writes the voter identifier, selections, per-award counts, and ballot count in one Firestore transaction. Reset closes voting, clears aggregate counts, and deletes ballot and voter documents. Sessions expire after eight hours; configure Firestore TTL on `sessions.expiresAt` to automatically remove expired session documents.
 
 ## Voting and administration
 
@@ -73,12 +72,10 @@ The server validates every vote and writes the voter record, anonymous vote, and
 - Rename the six default awards and replace the three nominee names before starting. Award and candidate management become locked after voting starts; reset the election to edit them again.
 - Optionally schedule a start date while the election is closed. Every start or reopen creates a 10-minute voting window; the server automatically closes voting at the deadline and rejects any later submissions.
 - Exactly six awards and three candidates are required to start voting. All three nominees appear under each award.
-- Voters enter an international-format mobile number, verify an SMS code, choose one nominee per award, and submit all six choices together. The server accepts only Firebase phone-auth ID tokens and stores a keyed hash of the verified number, rejecting repeat ballots from that number.
-- The responsive website uses Firebase Phone Authentication with reCAPTCHA and SMS verification in both desktop and mobile browsers. Phone sign-in must be enabled in Firebase Authentication, the production domain must be authorized, and Firebase SMS quotas/billing must be configured.
-- Existing Google voter identities cannot be migrated to phone numbers because those identifiers are stored only as keyed hashes. Reset the current election before accepting phone ballots to prevent previous voters from voting again under a new phone identity.
+- Voters enter a first and last name, choose one nominee for each award, and submit one complete ballot. The normalized full name may submit only one ballot.
+- The server accepts no more than 55 complete ballots. Because each ballot contains one choice per award, this caps each award at 55 votes; the server closes voting as soon as the limit is reached.
 - The administrator can rename awards from **Awards** and finish voting early from **Overview** or **Voting management**. Otherwise it closes automatically after 10 minutes. The overview and **Winner announcement** views then show the winner or tie for each award; while voting is open, they show current leaders only.
 - The voter page and administrator pages display a live countdown based on the election deadline saved by the server.
-- Phone sign-in verifies control of a number, but does not restrict voting to a pre-approved roster of numbers.
 - Results refresh every 10 seconds in the administrator dashboard. CSV export includes each award, nominee, vote total, and percentage.
 - The final winner or tie is determined independently for each award only after voting closes. Live detailed results remain administrator-only.
 

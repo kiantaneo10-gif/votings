@@ -7,10 +7,9 @@ const FirestoreSessionStore = require('./firestore-session-store');
 const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const { rateLimit } = require('express-rate-limit');
-const { getAuth } = require('firebase-admin/auth');
-const { app: firebaseApp, db, FieldValue, Timestamp } = require('./firebase');
+const { db, FieldValue, Timestamp } = require('./firebase');
 
-const requiredSecrets = ['SESSION_SECRET', 'VOTER_HASH_SECRET'];
+const requiredSecrets = ['SESSION_SECRET'];
 for (const name of requiredSecrets) {
   if (!process.env[name] || process.env[name].length < 32) {
     throw new Error(`${name} must be set to a random value of at least 32 characters.`);
@@ -24,8 +23,8 @@ const configRef = db.collection('electionConfig').doc('main');
 const candidatesRef = db.collection('candidates');
 const awardsRef = db.collection('awards');
 const requiredAwardCount = 6;
+const maxVotesPerAward = 55;
 const votingDurationMs = 10 * 60 * 1000;
-const firebaseAuth = getAuth(firebaseApp);
 const sessionStore = new FirestoreSessionStore();
 let autoCloseTimer;
 
@@ -43,22 +42,10 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       fontSrc: ["'self'"],
-      scriptSrc: ["'self'", 'https://www.gstatic.com', 'https://www.google.com'],
-      imgSrc: ["'self'", 'data:', 'https://www.gstatic.com', 'https://www.google.com'],
-      connectSrc: [
-        "'self'",
-        'https://identitytoolkit.googleapis.com',
-        'https://securetoken.googleapis.com',
-        'https://www.googleapis.com',
-        'https://www.google.com',
-        'https://recaptchaenterprise.googleapis.com'
-      ],
-      frameSrc: [
-        "'self'",
-        'https://votings-a4db3.firebaseapp.com',
-        'https://www.google.com',
-        'https://recaptcha.google.com'
-      ],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:'],
+      connectSrc: ["'self'"],
+      frameSrc: ["'self'"],
       objectSrc: ["'none'"],
       frameAncestors: ["'none'"]
     }
@@ -90,11 +77,22 @@ function timestampMillis(value) {
   return Number.isNaN(millis) ? null : millis;
 }
 
-function publicStatus(config) {
+function awardVoteCount(award) {
+  const results = award.results || {};
+  return Object.values(results).reduce((total, count) => total + Math.max(0, Number(count) || 0), 0);
+}
+
+function voteLimitReached(config, awards = []) {
+  return Number(config.totalBallots || 0) >= maxVotesPerAward ||
+    awards.some(award => awardVoteCount(award) >= maxVotesPerAward);
+}
+
+function publicStatus(config, awards = []) {
   const now = Date.now();
   const start = timestampMillis(config.startAt);
   const end = timestampMillis(config.endAt);
-  return Boolean(config.isOpen) && (start === null || now >= start) && end !== null && now < end
+  return Boolean(config.isOpen) && !voteLimitReached(config, awards) &&
+    (start === null || now >= start) && end !== null && now < end
     ? 'open'
     : 'closed';
 }
@@ -107,6 +105,10 @@ function dateToIso(value) {
 function dateToTimestamp(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : Timestamp.fromDate(date);
+}
+
+function validDocumentId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(id);
 }
 
 async function getConfig() {
@@ -189,33 +191,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function validDocumentId(id) {
-  return typeof id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(id);
-}
-
-async function verifiedPhoneNumber(req) {
-  const authorization = req.get('authorization') || '';
-  const tokenMatch = authorization.match(/^Bearer ([\w.-]+)$/);
-  if (!tokenMatch) throw new HttpError(401, 'Sign in with your phone number before voting.');
-  let decodedToken;
-  try {
-    decodedToken = await firebaseAuth.verifyIdToken(tokenMatch[1]);
-  } catch {
-    throw new HttpError(401, 'Your phone sign-in is invalid or expired. Sign in again.');
-  }
-  if (decodedToken.firebase?.sign_in_provider !== 'phone' ||
-      typeof decodedToken.phone_number !== 'string' ||
-      !/^\+[1-9]\d{7,14}$/.test(decodedToken.phone_number)) {
-    throw new HttpError(403, 'A verified phone number is required to vote.');
-  }
-  return decodedToken.phone_number;
-}
-
-function voterDocumentId(phoneNumber, epoch) {
-  const hash = crypto.createHmac('sha256', process.env.VOTER_HASH_SECRET).update(phoneNumber).digest('hex');
-  return `${Number(epoch || 1)}_${hash}`;
-}
-
 function toResults(candidates, voteCounts = null) {
   const counts = candidates.map(candidate =>
     Number(voteCounts ? voteCounts[candidate.id] || 0 : candidate.votes || 0) || 0);
@@ -279,11 +254,14 @@ app.get('/api/csrf', (req, res) => {
 
 app.get('/api/public', asyncRoute(async (req, res) => {
   const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const status = publicStatus(config);
+  const status = publicStatus(config, awards);
+  const limitReached = voteLimitReached(config, awards);
   res.set('Cache-Control', 'no-store');
   res.json({
     status,
-    phoneAuthReady: config.voterAuthProvider === 'phone',
+    totalBallots: Number(config.totalBallots || 0),
+    maxVotesPerAward,
+    limitReached,
     awards: awards.map(award => {
       const summary = summarizeAward(award, candidates, status);
       return {
@@ -296,17 +274,6 @@ app.get('/api/public', asyncRoute(async (req, res) => {
     startAt: dateToIso(config.startAt),
     endAt: dateToIso(config.endAt)
   });
-}));
-
-app.get('/api/voter/status', asyncRoute(async (req, res) => {
-  const phoneNumber = await verifiedPhoneNumber(req);
-  const config = await getConfig();
-  if (config.voterAuthProvider !== 'phone') {
-    throw new HttpError(409, 'An administrator must reset the election before phone voting can begin.');
-  }
-  const snapshot = await db.collection('voters').doc(voterDocumentId(phoneNumber, config.epoch)).get();
-  res.set('Cache-Control', 'no-store');
-  res.json({ hasVoted: snapshot.exists });
 }));
 
 app.post('/api/login', loginLimiter, requireCsrf, asyncRoute(async (req, res) => {
@@ -339,7 +306,7 @@ app.get('/api/admin/session', (req, res) => {
 app.post('/api/logout', requireAdmin, requireCsrf, (req, res, next) => {
   req.session.destroy(error => {
     if (error) return next(error);
-    res.clearCookie('award.sid', { httpOnly: true, sameSite: cookieSameSite, secure: cookieSecure });
+    res.clearCookie('award.sid', { httpOnly: true, sameSite: 'lax', secure: cookieSecure });
     res.json({ ok: true });
   });
 });
@@ -348,7 +315,7 @@ app.use('/api/admin', requireAdmin);
 
 app.get('/api/admin/summary', asyncRoute(async (req, res) => {
   const [config, candidates, awards] = await Promise.all([getConfig(), getCandidates(), getAwards()]);
-  const status = publicStatus(config);
+  const status = publicStatus(config, awards);
   const awardSummaries = awards.map(award => summarizeAward(award, candidates, status));
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -494,6 +461,9 @@ app.post('/api/admin/voting/:action', requireCsrf, asyncRoute(async (req, res) =
     ]);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
+    if (action !== 'close' && voteLimitReached(config, awards.docs.map(award => award.data()))) {
+      throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
+    }
     if (action !== 'close' && candidates.size !== 3) {
       throw new HttpError(409, 'Exactly three candidates are required before voting can open.');
     }
@@ -537,8 +507,6 @@ app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
     transaction.update(configRef, {
       isOpen: false,
       hasStarted: false,
-      epoch: Number(configSnapshot.get('epoch') || 1) + 1,
-      voterAuthProvider: 'phone',
       totalBallots: 0,
       endAt: null,
       updatedAt: FieldValue.serverTimestamp()
@@ -581,6 +549,14 @@ app.get('/api/admin/export.csv', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
+  const voterName = typeof req.body.voterName === 'string'
+    ? req.body.voterName.normalize('NFKC').trim().replace(/\s+/g, ' ')
+    : '';
+  const nameParts = voterName.split(' ');
+  if (voterName.length < 3 || voterName.length > 120 ||
+      nameParts.length < 2 || /[\u0000-\u001f\u007f]/.test(voterName)) {
+    return res.status(400).json({ error: 'Enter the voter’s full name (first and last name, 3 to 120 characters).' });
+  }
   const selections = req.body.selections;
   if (!selections || typeof selections !== 'object' || Array.isArray(selections)) {
     return res.status(400).json({ error: 'Choose one candidate for every award.' });
@@ -588,15 +564,13 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
   if (Object.keys(selections).length !== requiredAwardCount) {
     return res.status(400).json({ error: `Select one nominee for all ${requiredAwardCount} awards before submitting.` });
   }
-  const phoneNumber = await verifiedPhoneNumber(req);
-  await db.runTransaction(async transaction => {
+  const limitReached = await db.runTransaction(async transaction => {
     const configSnapshot = await transaction.get(configRef);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
-    if (config.voterAuthProvider !== 'phone') {
-      throw new HttpError(409, 'An administrator must reset the election before phone voting can begin.');
+    if (Number(config.totalBallots || 0) >= maxVotesPerAward) {
+      throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
     }
-    if (publicStatus(config) !== 'open') throw new HttpError(409, 'Voting is currently closed.');
 
     const [awardSnapshot, candidateSnapshot] = await Promise.all([
       transaction.get(awardsRef.orderBy('sortOrder')),
@@ -605,6 +579,11 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
     if (awardSnapshot.size !== requiredAwardCount || candidateSnapshot.size !== 3) {
       throw new HttpError(409, 'The six-award ballot is not ready for voting.');
     }
+    const awardData = awardSnapshot.docs.map(award => award.data());
+    if (voteLimitReached(config, awardData)) {
+      throw new HttpError(409, `The maximum of ${maxVotesPerAward} votes per award has been reached.`);
+    }
+    if (publicStatus(config, awardData) !== 'open') throw new HttpError(409, 'Voting is currently closed.');
     const candidateIds = new Set(candidateSnapshot.docs.map(candidate => candidate.id));
     const awardIds = new Set(awardSnapshot.docs.map(award => award.id));
     if (Object.keys(selections).some(id => !awardIds.has(id))) {
@@ -625,17 +604,20 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       }
       ballot[award.id] = candidateId;
     }
-    const voterRef = db.collection('voters').doc(voterDocumentId(phoneNumber, config.epoch));
+    const voterKey = crypto.createHash('sha256').update(voterName.toLowerCase('en-US')).digest('hex');
+    const voterRef = db.collection('voters').doc(voterKey);
     const voterSnapshot = await transaction.get(voterRef);
-    if (voterSnapshot.exists) throw new HttpError(409, 'This phone number has already voted.');
-
+    if (voterSnapshot.exists) {
+      throw new HttpError(409, 'This voter name has already submitted a ballot.');
+    }
     const voteRef = db.collection('votes').doc(crypto.randomBytes(16).toString('hex'));
-    transaction.create(voterRef, {
-      epoch: Number(config.epoch || 1),
+    transaction.create(voteRef, {
+      voterName,
+      selections: ballot,
       createdAt: FieldValue.serverTimestamp()
     });
-    transaction.create(voteRef, {
-      selections: ballot,
+    transaction.create(voterRef, {
+      name: voterName,
       createdAt: FieldValue.serverTimestamp()
     });
     awardSnapshot.docs.forEach(award => {
@@ -643,9 +625,21 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
         [`results.${ballot[award.id]}`]: FieldValue.increment(1)
       });
     });
-    transaction.update(configRef, { totalBallots: FieldValue.increment(1) });
+    const nextBallotCount = Number(config.totalBallots || 0) + 1;
+    const limitWillBeReached = nextBallotCount >= maxVotesPerAward ||
+      awardData.some(award => awardVoteCount(award) + 1 >= maxVotesPerAward);
+    transaction.update(configRef, {
+      totalBallots: FieldValue.increment(1),
+      ...(limitWillBeReached ? {
+        isOpen: false,
+        endAt: null,
+        updatedAt: FieldValue.serverTimestamp()
+      } : {})
+    });
+    return limitWillBeReached;
   });
-  res.json({ ok: true, awardsVoted: requiredAwardCount });
+  if (limitReached) scheduleAutoClose(null);
+  res.json({ ok: true, awardsVoted: requiredAwardCount, limitReached });
 }));
 
 app.use(express.static(path.join(__dirname, 'dist'), { index: false }));

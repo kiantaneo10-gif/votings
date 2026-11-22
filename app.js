@@ -1,13 +1,3 @@
-import {
-  initializePhoneRecaptcha,
-  getCurrentVoter,
-  getVoterIdToken,
-  resetPhoneVerification,
-  sendPhoneVerificationCode,
-  signOutVoter,
-  verifyPhoneVerificationCode
-} from './firebase-client.js';
-
 const main = document.getElementById('main-content');
 const statusPill = document.getElementById('public-status');
 const toast = document.getElementById('toast');
@@ -15,6 +5,7 @@ const dialog = document.getElementById('confirm-dialog');
 let csrfToken = '';
 let adminUsername = '';
 let pendingVote = null;
+let ballotSubmitted = false;
 let toastTimer;
 let pollTimer;
 let closeTimer;
@@ -52,41 +43,11 @@ function showToast(message) {
   toastTimer = window.setTimeout(() => toast.classList.remove('show'), 3200);
 }
 
-function phoneAuthErrorMessage(error) {
-  if (error.code === 'auth/operation-not-allowed') {
-    return 'Phone sign-in is not enabled in Firebase Authentication.';
-  }
-  if (error.code === 'auth/unauthorized-domain') {
-    return 'This site domain is not authorized for Firebase Authentication.';
-  }
-  if (error.code === 'auth/invalid-phone-number') {
-    return 'Enter a valid phone number in international format, including the country code.';
-  }
-  if (error.code === 'auth/invalid-verification-code') {
-    return 'That SMS verification code is incorrect.';
-  }
-  if (error.code === 'auth/code-expired') {
-    return 'That verification code has expired. Request a new code.';
-  }
-  if (error.code === 'auth/too-many-requests' || error.code === 'auth/quota-exceeded') {
-    return 'Too many SMS attempts. Wait a while before requesting another code.';
-  }
-  if (error.code === 'auth/captcha-check-failed') {
-    return 'The security check failed. Refresh the page and try again.';
-  }
-  return error.message || 'Phone verification could not be completed.';
-}
-
 async function api(url, options = {}) {
   const method = options.method || 'GET';
   const headers = { ...(options.headers || {}) };
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && csrfToken) headers['X-CSRF-Token'] = csrfToken;
-  if (url === '/api/vote' || url === '/api/voter/status') {
-    const token = await getVoterIdToken();
-    if (!token) throw new Error('Sign in with your phone number before voting.');
-    headers.Authorization = `Bearer ${token}`;
-  }
   const response = await fetch(url, {
     method,
     credentials: 'same-origin',
@@ -147,36 +108,22 @@ function setViewClass(name) {
 
 async function renderPublic(errorMessage = '') {
   clearPoll();
-  resetPhoneVerification();
   setViewClass('main-content');
   main.innerHTML = '<div class="loading-panel">Loading voting status…</div>';
   try {
-    const [data, voter] = await Promise.all([api('/api/public'), getCurrentVoter()]);
+    const data = await api('/api/public');
     setStatus(data.status, data.endAt);
     const awards = Array.isArray(data.awards) ? data.awards : [];
     const votingReady = awards.length === 6 && awards.every(award => award.candidates.length === 3);
-    const phoneAuthReady = data.phoneAuthReady === true;
-    const voterStatus = voter && phoneAuthReady ? await api('/api/voter/status') : { hasVoted: false };
-    if (voterStatus.hasVoted) {
+    if (ballotSubmitted) {
       main.innerHTML = `
         <section class="hero"><span class="eyebrow">YOUR SIX-AWARD BALLOT</span><h1>Thank you for voting.</h1></section>
         <section class="panel success-panel">
           <div class="success-icon" aria-hidden="true">✓</div>
-          <h2>Your ballot is complete.</h2>
-          <p class="muted">Your choices for all six awards have been recorded. Each verified phone number may submit one ballot.</p>
-          <button id="voter-signout" class="button button-secondary" type="button">Sign out</button>
+          <h2>Your ballot has been recorded.</h2>
+          <p class="muted">The voter name and ballot were recorded. ${data.totalBallots} of ${data.maxVotesPerAward} ballots have been submitted.</p>
+          ${data.limitReached ? '<p class="field-help">The maximum vote count has been reached for every award.</p>' : ''}
         </section>`;
-      const signOutButton = document.getElementById('voter-signout');
-      signOutButton.addEventListener('click', async () => {
-        signOutButton.disabled = true;
-        try {
-          await signOutVoter();
-          await renderPublic();
-        } catch (error) {
-          signOutButton.disabled = false;
-          showToast(error.message);
-        }
-      });
       return;
     }
 
@@ -202,7 +149,7 @@ async function renderPublic(errorMessage = '') {
         <div class="ballot-options">
           ${award.candidates.map(candidate => `
             <label class="ballot-option">
-              <input type="radio" name="award-${escapeHtml(award.id)}" value="${escapeHtml(candidate.id)}" required ${!phoneAuthReady || !voter || data.status !== 'open' || !votingReady ? 'disabled' : ''}>
+              <input type="radio" name="award-${escapeHtml(award.id)}" value="${escapeHtml(candidate.id)}" required ${data.status !== 'open' || !votingReady ? 'disabled' : ''}>
               <span>${escapeHtml(candidate.name)}</span>
             </label>`).join('')}
         </div>
@@ -216,120 +163,64 @@ async function renderPublic(errorMessage = '') {
       ${countdownMarkup(data.status, data.endAt)}
       ${winnerMarkup}
       ${errorMessage ? `<div class="alert" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
-      ${!phoneAuthReady ? '<div class="alert" role="alert">An administrator must reset the election before phone voting can begin. Resetting deletes all existing ballots.</div>' : ''}
+      ${data.limitReached ? '<div class="alert" role="alert">The maximum of 55 votes per award has been reached. Voting is closed.</div>' : ''}
       ${!votingReady ? '<div class="alert" role="alert">The administrator is completing the six awards and three nominees. Voting will open when the ballot is ready.</div>' : ''}
-      ${data.status === 'open' && votingReady && phoneAuthReady ? `
-        <div class="panel center-panel">
-          ${voter
-            ? `<p class="muted" style="margin-bottom:14px">Signed in as <strong>${escapeHtml(voter.phoneNumber || 'verified phone number')}</strong></p><button id="voter-signout" class="button button-secondary button-sm" type="button">Sign out</button>`
-            : `<p class="muted">Sign in with your mobile number. We’ll send a verification code by SMS; standard message rates may apply. Each verified phone number may submit one ballot.</p>
-              <div class="field">
-                <label for="phone-number">Mobile number (include country code)</label>
-                <input id="phone-number" type="tel" inputmode="tel" autocomplete="tel" placeholder="+14155552671" pattern="[+][1-9][0-9]{7,14}" required>
-              </div>
-              <div id="phone-recaptcha-container"></div>
-              <div class="sign-in-options">
-                <button id="phone-send-code" class="button button-primary" type="button">Send SMS code</button>
-              </div>
-              <p id="phone-auth-status" class="field-help" role="status" aria-live="polite"></p>
-              <div id="phone-code-panel" hidden>
-                <div class="field">
-                  <label for="phone-verification-code">Six-digit SMS code</label>
-                  <input id="phone-verification-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
-                </div>
-                <div class="sign-in-options">
-                  <button id="phone-verify-code" class="button button-primary" type="button">Verify and sign in</button>
-                </div>
-              </div>`}
-        </div>` : ''}
-      ${awards.length ? `<form id="ballot-form" class="ballot-form">${ballot}<div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Sign in and choose one name for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>Submit all six choices (0/6)</button></div></form>` : ''}
-      <div class="vote-note"><span><strong>One verified phone number, one ballot.</strong> The voting database stores only a keyed hash of your number; Firebase Authentication processes it to verify your sign-in. Individual choices are never displayed publicly.</span></div>
+      ${awards.length ? `<form id="ballot-form" class="ballot-form">
+        <section class="panel center-panel">
+          <div class="field">
+            <label for="voter-name">Full name of voter</label>
+            <input id="voter-name" type="text" autocomplete="name" minlength="3" maxlength="120" required>
+          </div>
+          <p class="field-help">Enter your first and last name. Each full name may submit one ballot; voting stops after 55 ballots.</p>
+        </section>
+        ${ballot}
+        <div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Enter your name and choose one nominee for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>Submit all six choices (0/6)</button></div>
+      </form>` : ''}
+      <div class="vote-note"><span><strong>Maximum 55 votes per award.</strong> ${Number(data.totalBallots || 0)} of ${data.maxVotesPerAward} complete ballots submitted. One ballot is allowed per full name; the limit is enforced by the server.</span></div>
       <div class="inline-actions" style="justify-content:center;margin-top:18px"><a class="muted" href="#login" style="font-size:12px">Administrator sign in</a></div>`;
-
-    const recaptchaContainer = document.getElementById('phone-recaptcha-container');
-    if (recaptchaContainer) {
-      try {
-        await initializePhoneRecaptcha();
-      } catch (error) {
-        showToast(phoneAuthErrorMessage(error));
-      }
-    }
-
-    const sendCodeButton = document.getElementById('phone-send-code');
-    if (sendCodeButton) sendCodeButton.addEventListener('click', async () => {
-      const phoneInput = document.getElementById('phone-number');
-      const status = document.getElementById('phone-auth-status');
-      if (!phoneInput.reportValidity()) return;
-      sendCodeButton.disabled = true;
-      try {
-        await sendPhoneVerificationCode(phoneInput.value);
-        document.getElementById('phone-code-panel').hidden = false;
-        sendCodeButton.textContent = 'Send a new code';
-        status.textContent = 'SMS code sent. Enter it below to finish signing in.';
-        document.getElementById('phone-verification-code').focus();
-      } catch (error) {
-        showToast(phoneAuthErrorMessage(error));
-      } finally {
-        sendCodeButton.disabled = false;
-      }
-    });
-    const verifyCodeButton = document.getElementById('phone-verify-code');
-    if (verifyCodeButton) verifyCodeButton.addEventListener('click', async () => {
-      verifyCodeButton.disabled = true;
-      try {
-        await verifyPhoneVerificationCode(document.getElementById('phone-verification-code').value);
-        await renderPublic();
-      } catch (error) {
-        verifyCodeButton.disabled = false;
-        showToast(phoneAuthErrorMessage(error));
-      }
-    });
-    const signOutButton = document.getElementById('voter-signout');
-    if (signOutButton) signOutButton.addEventListener('click', async () => {
-      try {
-        await signOutVoter();
-        renderPublic();
-      } catch (error) {
-        showToast(error.message);
-      }
-    });
 
     const ballotForm = document.getElementById('ballot-form');
     if (ballotForm) {
       const submitButton = document.getElementById('submit-ballot');
       const validationMessage = document.getElementById('ballot-validation');
+      const voterNameInput = document.getElementById('voter-name');
       const updateBallotButton = () => {
         const missingAwards = awards.filter(award =>
           !ballotForm.querySelector(`input[name="award-${award.id}"]:checked`)
         );
         const selectedCount = awards.length - missingAwards.length;
-        submitButton.disabled = missingAwards.length > 0 || !phoneAuthReady || !voter || data.status !== 'open';
+        const normalizedName = voterNameInput.value.trim().replace(/\s+/g, ' ');
+        const nameParts = normalizedName.split(' ');
+        const hasName = nameParts.length >= 2 && normalizedName.length >= 3;
+        submitButton.disabled = missingAwards.length > 0 || !hasName || data.status !== 'open' || !votingReady;
         submitButton.textContent = `Submit all six choices (${selectedCount}/${awards.length})`;
-        validationMessage.textContent = !phoneAuthReady
-          ? 'An administrator must reset the election before phone voting can begin.'
-          : data.status !== 'open'
+        validationMessage.textContent = data.status !== 'open'
           ? 'Voting is closed.'
-          : !voter
-            ? 'Sign in with your phone number to choose one nominee for every award.'
+          : !hasName
+            ? 'Enter the voter’s full name.'
             : missingAwards.length
               ? `Choose one name for each remaining award: ${missingAwards.map(award => award.title).join(', ')}.`
               : 'All six awards are selected. Review your choices before submitting.';
       };
       ballotForm.addEventListener('change', updateBallotButton);
+      voterNameInput.addEventListener('input', updateBallotButton);
       ballotForm.addEventListener('submit', event => {
         event.preventDefault();
+        const voterName = voterNameInput.value.trim().replace(/\s+/g, ' ');
+        const nameParts = voterName.split(' ');
         const selections = Object.fromEntries(awards.map(award => {
           const input = ballotForm.querySelector(`input[name="award-${award.id}"]:checked`);
           return [award.id, input ? input.value : ''];
         }));
-        if (Object.values(selections).some(candidateId => !candidateId)) return;
-        pendingVote = selections;
+        if (nameParts.length < 2 || voterName.length < 3 ||
+            Object.values(selections).some(candidateId => !candidateId)) return;
+        pendingVote = { voterName, selections };
         const chosenNames = awards.map(award => {
           const candidate = award.candidates.find(item => item.id === selections[award.id]);
           return `${award.title}: ${candidate ? candidate.name : ''}`;
         });
         document.getElementById('confirm-title').textContent = 'Submit your six-award ballot?';
-        document.getElementById('confirm-copy').textContent = chosenNames.join(' · ');
+        document.getElementById('confirm-copy').textContent = [`Voter: ${voterName}`, ...chosenNames].join(' · ');
         document.getElementById('confirm-submit').textContent = 'Confirm all six choices';
         dialog.returnValue = 'cancel';
         dialog.showModal();
@@ -351,7 +242,8 @@ async function submitVote() {
   const vote = pendingVote;
   pendingVote = null;
   try {
-    await api('/api/vote', { method: 'POST', body: { selections: vote } });
+    await api('/api/vote', { method: 'POST', body: vote });
+    ballotSubmitted = true;
     await renderPublic();
   } catch (error) {
     await renderPublic(error.message);
@@ -517,7 +409,7 @@ async function renderAdmin(view = 'dashboard') {
         </section>
         <section class="panel" style="margin-top:16px">
           <h2>Reset election</h2>
-          <p class="muted">Permanently remove every six-award ballot and voter identifier. This also activates phone-number voting; voting will be closed and award and candidate names unlocked.</p>
+          <p class="muted">Permanently remove every six-award ballot and clear the vote totals. Voting will be closed, and award and candidate names will be unlocked.</p>
           <button id="reset-election" class="button button-danger">Reset all votes</button>
         </section>`;
     } else if (view === 'results') {
@@ -624,7 +516,7 @@ function bindAdminActions(view) {
   if (finish) finish.addEventListener('click', () => changeVoting('close', 'Finish voting now? New ballots will no longer be accepted.'));
   const reset = document.getElementById('reset-election');
   if (reset) reset.addEventListener('click', async () => {
-    if (!window.confirm('Reset all votes and voter records? This cannot be undone.')) return;
+    if (!window.confirm('Permanently delete all ballots and clear every vote total? This cannot be undone.')) return;
     try {
       await api('/api/admin/reset', { method: 'POST', body: {} });
       showToast('Election reset. All votes have been removed.');
