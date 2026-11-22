@@ -1,9 +1,11 @@
 import {
-  completeGoogleRedirect,
+  initializePhoneRecaptcha,
   getCurrentVoter,
   getVoterIdToken,
-  signInWithGoogle,
-  signOutVoter
+  resetPhoneVerification,
+  sendPhoneVerificationCode,
+  signOutVoter,
+  verifyPhoneVerificationCode
 } from './firebase-client.js';
 
 const main = document.getElementById('main-content');
@@ -50,17 +52,29 @@ function showToast(message) {
   toastTimer = window.setTimeout(() => toast.classList.remove('show'), 3200);
 }
 
-function googleAuthErrorMessage(error) {
+function phoneAuthErrorMessage(error) {
   if (error.code === 'auth/operation-not-allowed') {
-    return 'Google sign-in is not enabled in Firebase Authentication.';
+    return 'Phone sign-in is not enabled in Firebase Authentication.';
   }
   if (error.code === 'auth/unauthorized-domain') {
     return 'This site domain is not authorized for Firebase Authentication.';
   }
-  if (error.code === 'auth/popup-blocked') {
-    return 'Your browser blocked the Google sign-in window. Allow pop-ups for this site and try again.';
+  if (error.code === 'auth/invalid-phone-number') {
+    return 'Enter a valid phone number in international format, including the country code.';
   }
-  return error.message || 'Google sign-in could not be completed.';
+  if (error.code === 'auth/invalid-verification-code') {
+    return 'That SMS verification code is incorrect.';
+  }
+  if (error.code === 'auth/code-expired') {
+    return 'That verification code has expired. Request a new code.';
+  }
+  if (error.code === 'auth/too-many-requests' || error.code === 'auth/quota-exceeded') {
+    return 'Too many SMS attempts. Wait a while before requesting another code.';
+  }
+  if (error.code === 'auth/captcha-check-failed') {
+    return 'The security check failed. Refresh the page and try again.';
+  }
+  return error.message || 'Phone verification could not be completed.';
 }
 
 async function api(url, options = {}) {
@@ -70,7 +84,7 @@ async function api(url, options = {}) {
   if (method !== 'GET' && csrfToken) headers['X-CSRF-Token'] = csrfToken;
   if (url === '/api/vote' || url === '/api/voter/status') {
     const token = await getVoterIdToken();
-    if (!token) throw new Error('Sign in with Google before voting.');
+    if (!token) throw new Error('Sign in with your phone number before voting.');
     headers.Authorization = `Bearer ${token}`;
   }
   const response = await fetch(url, {
@@ -133,6 +147,7 @@ function setViewClass(name) {
 
 async function renderPublic(errorMessage = '') {
   clearPoll();
+  resetPhoneVerification();
   setViewClass('main-content');
   main.innerHTML = '<div class="loading-panel">Loading voting status…</div>';
   try {
@@ -140,14 +155,15 @@ async function renderPublic(errorMessage = '') {
     setStatus(data.status, data.endAt);
     const awards = Array.isArray(data.awards) ? data.awards : [];
     const votingReady = awards.length === 6 && awards.every(award => award.candidates.length === 3);
-    const voterStatus = voter ? await api('/api/voter/status') : { hasVoted: false };
+    const phoneAuthReady = data.phoneAuthReady === true;
+    const voterStatus = voter && phoneAuthReady ? await api('/api/voter/status') : { hasVoted: false };
     if (voterStatus.hasVoted) {
       main.innerHTML = `
         <section class="hero"><span class="eyebrow">YOUR SIX-AWARD BALLOT</span><h1>Thank you for voting.</h1></section>
         <section class="panel success-panel">
           <div class="success-icon" aria-hidden="true">✓</div>
           <h2>Your ballot is complete.</h2>
-          <p class="muted">Your choices for all six awards have been recorded. Each Google account may submit one ballot.</p>
+          <p class="muted">Your choices for all six awards have been recorded. Each verified phone number may submit one ballot.</p>
           <button id="voter-signout" class="button button-secondary" type="button">Sign out</button>
         </section>`;
       const signOutButton = document.getElementById('voter-signout');
@@ -186,7 +202,7 @@ async function renderPublic(errorMessage = '') {
         <div class="ballot-options">
           ${award.candidates.map(candidate => `
             <label class="ballot-option">
-              <input type="radio" name="award-${escapeHtml(award.id)}" value="${escapeHtml(candidate.id)}" required ${!voter || data.status !== 'open' || !votingReady ? 'disabled' : ''}>
+              <input type="radio" name="award-${escapeHtml(award.id)}" value="${escapeHtml(candidate.id)}" required ${!phoneAuthReady || !voter || data.status !== 'open' || !votingReady ? 'disabled' : ''}>
               <span>${escapeHtml(candidate.name)}</span>
             </label>`).join('')}
         </div>
@@ -200,29 +216,72 @@ async function renderPublic(errorMessage = '') {
       ${countdownMarkup(data.status, data.endAt)}
       ${winnerMarkup}
       ${errorMessage ? `<div class="alert" role="alert">${escapeHtml(errorMessage)}</div>` : ''}
+      ${!phoneAuthReady ? '<div class="alert" role="alert">An administrator must reset the election before phone voting can begin. Resetting deletes all existing ballots.</div>' : ''}
       ${!votingReady ? '<div class="alert" role="alert">The administrator is completing the six awards and three nominees. Voting will open when the ballot is ready.</div>' : ''}
-      ${data.status === 'open' && votingReady ? `
+      ${data.status === 'open' && votingReady && phoneAuthReady ? `
         <div class="panel center-panel">
           ${voter
-            ? `<p class="muted" style="margin-bottom:14px">Signed in as <strong>${escapeHtml(voter.email || 'Google account')}</strong></p><button id="voter-signout" class="button button-secondary button-sm" type="button">Sign out</button>`
-            : `<p class="muted">Sign in with Google to vote. Each verified Google email can submit one ballot. On phones, choose a Google account offered by your browser.</p>
+            ? `<p class="muted" style="margin-bottom:14px">Signed in as <strong>${escapeHtml(voter.phoneNumber || 'verified phone number')}</strong></p><button id="voter-signout" class="button button-secondary button-sm" type="button">Sign out</button>`
+            : `<p class="muted">Sign in with your mobile number. We’ll send a verification code by SMS; standard message rates may apply. Each verified phone number may submit one ballot.</p>
+              <div class="field">
+                <label for="phone-number">Mobile number (include country code)</label>
+                <input id="phone-number" type="tel" inputmode="tel" autocomplete="tel" placeholder="+14155552671" pattern="[+][1-9][0-9]{7,14}" required>
+              </div>
+              <div id="phone-recaptcha-container"></div>
               <div class="sign-in-options">
-                <button id="google-signin" class="button button-primary" type="button">Continue with Google</button>
+                <button id="phone-send-code" class="button button-primary" type="button">Send SMS code</button>
+              </div>
+              <p id="phone-auth-status" class="field-help" role="status" aria-live="polite"></p>
+              <div id="phone-code-panel" hidden>
+                <div class="field">
+                  <label for="phone-verification-code">Six-digit SMS code</label>
+                  <input id="phone-verification-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+                </div>
+                <div class="sign-in-options">
+                  <button id="phone-verify-code" class="button button-primary" type="button">Verify and sign in</button>
+                </div>
               </div>`}
         </div>` : ''}
       ${awards.length ? `<form id="ballot-form" class="ballot-form">${ballot}<div class="ballot-submit"><p id="ballot-validation" class="field-help" role="status">Sign in and choose one name for every award.</p><button id="submit-ballot" class="button button-primary" type="submit" disabled>Submit all six choices (0/6)</button></div></form>` : ''}
-      <div class="vote-note"><span><strong>One verified Google account, one ballot.</strong> Your account email is stored only as a secure hash; individual choices are never displayed publicly.</span></div>
+      <div class="vote-note"><span><strong>One verified phone number, one ballot.</strong> The voting database stores only a keyed hash of your number; Firebase Authentication processes it to verify your sign-in. Individual choices are never displayed publicly.</span></div>
       <div class="inline-actions" style="justify-content:center;margin-top:18px"><a class="muted" href="#login" style="font-size:12px">Administrator sign in</a></div>`;
 
-    const signInButton = document.getElementById('google-signin');
-    if (signInButton) signInButton.addEventListener('click', async () => {
-      signInButton.disabled = true;
+    const recaptchaContainer = document.getElementById('phone-recaptcha-container');
+    if (recaptchaContainer) {
       try {
-        const signedInUser = await signInWithGoogle();
-        if (signedInUser) await renderPublic();
+        await initializePhoneRecaptcha();
       } catch (error) {
-        signInButton.disabled = false;
-        showToast(googleAuthErrorMessage(error));
+        showToast(phoneAuthErrorMessage(error));
+      }
+    }
+
+    const sendCodeButton = document.getElementById('phone-send-code');
+    if (sendCodeButton) sendCodeButton.addEventListener('click', async () => {
+      const phoneInput = document.getElementById('phone-number');
+      const status = document.getElementById('phone-auth-status');
+      if (!phoneInput.reportValidity()) return;
+      sendCodeButton.disabled = true;
+      try {
+        await sendPhoneVerificationCode(phoneInput.value);
+        document.getElementById('phone-code-panel').hidden = false;
+        sendCodeButton.textContent = 'Send a new code';
+        status.textContent = 'SMS code sent. Enter it below to finish signing in.';
+        document.getElementById('phone-verification-code').focus();
+      } catch (error) {
+        showToast(phoneAuthErrorMessage(error));
+      } finally {
+        sendCodeButton.disabled = false;
+      }
+    });
+    const verifyCodeButton = document.getElementById('phone-verify-code');
+    if (verifyCodeButton) verifyCodeButton.addEventListener('click', async () => {
+      verifyCodeButton.disabled = true;
+      try {
+        await verifyPhoneVerificationCode(document.getElementById('phone-verification-code').value);
+        await renderPublic();
+      } catch (error) {
+        verifyCodeButton.disabled = false;
+        showToast(phoneAuthErrorMessage(error));
       }
     });
     const signOutButton = document.getElementById('voter-signout');
@@ -244,12 +303,14 @@ async function renderPublic(errorMessage = '') {
           !ballotForm.querySelector(`input[name="award-${award.id}"]:checked`)
         );
         const selectedCount = awards.length - missingAwards.length;
-        submitButton.disabled = missingAwards.length > 0 || !voter || data.status !== 'open';
+        submitButton.disabled = missingAwards.length > 0 || !phoneAuthReady || !voter || data.status !== 'open';
         submitButton.textContent = `Submit all six choices (${selectedCount}/${awards.length})`;
-        validationMessage.textContent = data.status !== 'open'
+        validationMessage.textContent = !phoneAuthReady
+          ? 'An administrator must reset the election before phone voting can begin.'
+          : data.status !== 'open'
           ? 'Voting is closed.'
           : !voter
-            ? 'Sign in with Google to choose one nominee for every award.'
+            ? 'Sign in with your phone number to choose one nominee for every award.'
             : missingAwards.length
               ? `Choose one name for each remaining award: ${missingAwards.map(award => award.title).join(', ')}.`
               : 'All six awards are selected. Review your choices before submitting.';
@@ -456,7 +517,7 @@ async function renderAdmin(view = 'dashboard') {
         </section>
         <section class="panel" style="margin-top:16px">
           <h2>Reset election</h2>
-          <p class="muted">Permanently remove every six-award ballot and voter identifier. Voting will be closed and award and candidate names unlocked.</p>
+          <p class="muted">Permanently remove every six-award ballot and voter identifier. This also activates phone-number voting; voting will be closed and award and candidate names unlocked.</p>
           <button id="reset-election" class="button button-danger">Reset all votes</button>
         </section>`;
     } else if (view === 'results') {
@@ -667,11 +728,6 @@ async function boot() {
   try {
     const csrf = await api('/api/csrf');
     csrfToken = csrf.csrfToken;
-    try {
-      await completeGoogleRedirect();
-    } catch (error) {
-      showToast(googleAuthErrorMessage(error));
-    }
     await route();
   } catch (error) {
     setViewClass('main-content');

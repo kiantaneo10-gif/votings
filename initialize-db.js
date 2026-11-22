@@ -36,6 +36,7 @@ async function main() {
         startAt: Timestamp.now(),
         endAt: null,
         epoch: 1,
+        voterAuthProvider: 'phone',
         totalBallots: 0,
         updatedAt: FieldValue.serverTimestamp()
       });

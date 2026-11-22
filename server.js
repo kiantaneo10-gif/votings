@@ -4,7 +4,6 @@ const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const FirestoreSessionStore = require('./firestore-session-store');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const { rateLimit } = require('express-rate-limit');
@@ -38,31 +37,32 @@ class HttpError extends Error {
 }
 
 app.disable('x-powered-by');
-app.use(createProxyMiddleware({
-  target: `https://${process.env.FIREBASE_PROJECT_ID || 'votings-a4db3'}.firebaseapp.com`,
-  changeOrigin: true,
-  pathFilter: pathname => /^\/__\/auth(?:\/|$)/.test(pathname)
-}));
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       fontSrc: ["'self'"],
-      scriptSrc: ["'self'", 'https://www.gstatic.com', 'https://apis.google.com'],
-      imgSrc: ["'self'", 'data:'],
+      scriptSrc: ["'self'", 'https://www.gstatic.com', 'https://www.google.com'],
+      imgSrc: ["'self'", 'data:', 'https://www.gstatic.com', 'https://www.google.com'],
       connectSrc: [
         "'self'",
         'https://identitytoolkit.googleapis.com',
         'https://securetoken.googleapis.com',
-        'https://www.googleapis.com'
+        'https://www.googleapis.com',
+        'https://www.google.com',
+        'https://recaptchaenterprise.googleapis.com'
       ],
-      frameSrc: ["'self'", 'https://votings-a4db3.firebaseapp.com', 'https://accounts.google.com'],
+      frameSrc: [
+        "'self'",
+        'https://votings-a4db3.firebaseapp.com',
+        'https://www.google.com',
+        'https://recaptcha.google.com'
+      ],
       objectSrc: ["'none'"],
       frameAncestors: ["'none'"]
     }
-  },
-  crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' }
+  }
 }));
 app.use(express.json({ limit: '16kb' }));
 app.use(session({
@@ -193,25 +193,26 @@ function validDocumentId(id) {
   return typeof id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(id);
 }
 
-async function verifiedGoogleEmail(req) {
+async function verifiedPhoneNumber(req) {
   const authorization = req.get('authorization') || '';
   const tokenMatch = authorization.match(/^Bearer ([\w.-]+)$/);
-  if (!tokenMatch) throw new HttpError(401, 'Sign in with Google before voting.');
+  if (!tokenMatch) throw new HttpError(401, 'Sign in with your phone number before voting.');
   let decodedToken;
   try {
     decodedToken = await firebaseAuth.verifyIdToken(tokenMatch[1]);
   } catch {
-    throw new HttpError(401, 'Your Google sign-in is invalid or expired. Sign in again.');
+    throw new HttpError(401, 'Your phone sign-in is invalid or expired. Sign in again.');
   }
-  if (decodedToken.firebase?.sign_in_provider !== 'google.com' ||
-      typeof decodedToken.email !== 'string' || decodedToken.email_verified !== true) {
-    throw new HttpError(403, 'A verified Google account is required to vote.');
+  if (decodedToken.firebase?.sign_in_provider !== 'phone' ||
+      typeof decodedToken.phone_number !== 'string' ||
+      !/^\+[1-9]\d{7,14}$/.test(decodedToken.phone_number)) {
+    throw new HttpError(403, 'A verified phone number is required to vote.');
   }
-  return decodedToken.email.normalize('NFKC').trim().toLocaleLowerCase('en-US');
+  return decodedToken.phone_number;
 }
 
-function voterDocumentId(email, epoch) {
-  const hash = crypto.createHmac('sha256', process.env.VOTER_HASH_SECRET).update(email).digest('hex');
+function voterDocumentId(phoneNumber, epoch) {
+  const hash = crypto.createHmac('sha256', process.env.VOTER_HASH_SECRET).update(phoneNumber).digest('hex');
   return `${Number(epoch || 1)}_${hash}`;
 }
 
@@ -282,6 +283,7 @@ app.get('/api/public', asyncRoute(async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
     status,
+    phoneAuthReady: config.voterAuthProvider === 'phone',
     awards: awards.map(award => {
       const summary = summarizeAward(award, candidates, status);
       return {
@@ -297,9 +299,12 @@ app.get('/api/public', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/voter/status', asyncRoute(async (req, res) => {
-  const email = await verifiedGoogleEmail(req);
+  const phoneNumber = await verifiedPhoneNumber(req);
   const config = await getConfig();
-  const snapshot = await db.collection('voters').doc(voterDocumentId(email, config.epoch)).get();
+  if (config.voterAuthProvider !== 'phone') {
+    throw new HttpError(409, 'An administrator must reset the election before phone voting can begin.');
+  }
+  const snapshot = await db.collection('voters').doc(voterDocumentId(phoneNumber, config.epoch)).get();
   res.set('Cache-Control', 'no-store');
   res.json({ hasVoted: snapshot.exists });
 }));
@@ -533,6 +538,7 @@ app.post('/api/admin/reset', requireCsrf, asyncRoute(async (req, res) => {
       isOpen: false,
       hasStarted: false,
       epoch: Number(configSnapshot.get('epoch') || 1) + 1,
+      voterAuthProvider: 'phone',
       totalBallots: 0,
       endAt: null,
       updatedAt: FieldValue.serverTimestamp()
@@ -582,11 +588,14 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
   if (Object.keys(selections).length !== requiredAwardCount) {
     return res.status(400).json({ error: `Select one nominee for all ${requiredAwardCount} awards before submitting.` });
   }
-  const email = await verifiedGoogleEmail(req);
+  const phoneNumber = await verifiedPhoneNumber(req);
   await db.runTransaction(async transaction => {
     const configSnapshot = await transaction.get(configRef);
     if (!configSnapshot.exists) throw new Error('Firestore election configuration is missing. Run npm run initialize-db.');
     const config = configSnapshot.data();
+    if (config.voterAuthProvider !== 'phone') {
+      throw new HttpError(409, 'An administrator must reset the election before phone voting can begin.');
+    }
     if (publicStatus(config) !== 'open') throw new HttpError(409, 'Voting is currently closed.');
 
     const [awardSnapshot, candidateSnapshot] = await Promise.all([
@@ -616,9 +625,9 @@ app.post('/api/vote', requireCsrf, asyncRoute(async (req, res) => {
       }
       ballot[award.id] = candidateId;
     }
-    const voterRef = db.collection('voters').doc(voterDocumentId(email, config.epoch));
+    const voterRef = db.collection('voters').doc(voterDocumentId(phoneNumber, config.epoch));
     const voterSnapshot = await transaction.get(voterRef);
-    if (voterSnapshot.exists) throw new HttpError(409, 'This Google account has already voted.');
+    if (voterSnapshot.exists) throw new HttpError(409, 'This phone number has already voted.');
 
     const voteRef = db.collection('votes').doc(crypto.randomBytes(16).toString('hex'));
     transaction.create(voterRef, {
